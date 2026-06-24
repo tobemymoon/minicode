@@ -47,6 +47,8 @@ class AgentSessionOptions:
     max_context_tokens: Optional[int] = None
     retain_recent_messages: int = 24
     summary_builder: Optional[Callable[[list[Message]], str]] = None
+    auto_memory: bool = True
+    memory_prompt_limit: int = 12
     retry_enabled: bool = True
     max_retries: int = 2
     retry_base_delay_ms: int = 1200
@@ -107,6 +109,8 @@ class CreateAgentSessionOptions:
     max_context_tokens: Optional[int] = None
     retain_recent_messages: int = 24
     summary_builder: Optional[Callable[[list[Message]], str]] = None
+    auto_memory: bool = True
+    memory_prompt_limit: int = 12
     retry_enabled: bool = True
     max_retries: int = 2
     retry_base_delay_ms: int = 1200

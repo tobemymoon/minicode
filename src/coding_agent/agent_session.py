@@ -35,6 +35,7 @@ from agent_core.types import BeforeToolCallContext, BeforeToolCallResult
 
 from .artifacts import ArtifactStore, ContextCompressor, ToolResultCompactor
 from .extensions.types import ExtensionLifecycleContext
+from .memory import MemoryReflector, MemoryStore
 from .session_store import SessionStore, new_session_id
 from .types import AgentSessionOptions
 
@@ -66,7 +67,11 @@ class AgentSession:
         self.artifact_store = ArtifactStore(self.workspace_dir, self.session_id)
         self.artifact_store.ensure_initialized()
         self.context_compressor = ContextCompressor(ToolResultCompactor(self.artifact_store))
+        self.memory_store = MemoryStore(self.workspace_dir)
+        self.memory_store.ensure_initialized()
+        self.memory_reflector = MemoryReflector(self.memory_store)
         self._logged_context_artifacts: set[str] = set()
+        self._active_memory_context: UserMessage | None = None
 
         persisted_messages = self.store.load_session_messages()
         if not persisted_messages:
@@ -95,6 +100,9 @@ class AgentSession:
         self.max_context_tokens = options.max_context_tokens
         self.retain_recent_messages = options.retain_recent_messages
         self.summary_builder = options.summary_builder
+        self.auto_memory = options.auto_memory
+        self.memory_prompt_limit = options.memory_prompt_limit
+        self.memory_retrieval_limit = min(max(1, options.memory_prompt_limit), 5)
         self.tool_execution = options.tool_execution
         self.prompt_cache = options.prompt_cache
         self.prompt_cache_ttl = options.prompt_cache_ttl
@@ -169,20 +177,34 @@ class AgentSession:
     async def prompt(self, text: str, *, images: list[str] | None = None) -> list[AgentMessage]:
         await self._run_lifecycle_hooks(text=text, is_continue=False, hooks=self.before_prompt_hooks)
         await self._check_and_compact_before_prompt()
-        result = await self._run_with_retry(lambda: self.agent.prompt(text, images=images))
-        await self._compact_context_if_needed()
-        await self._run_lifecycle_hooks(text=text, is_continue=False, hooks=self.after_prompt_hooks)
-        return result
+        self._prepare_memory_context(text)
+        before_count = len(self.agent.state.messages)
+        try:
+            result = await self._run_with_retry(lambda: self.agent.prompt(text, images=images))
+            self._reflect_memory_from_new_messages(before_count)
+            await self._compact_context_if_needed()
+            await self._run_lifecycle_hooks(text=text, is_continue=False, hooks=self.after_prompt_hooks)
+            return result
+        finally:
+            self._active_memory_context = None
 
     async def prompt_message(self, message: UserMessage) -> list[AgentMessage]:
         await self._check_and_compact_before_prompt()
-        result = await self._run_with_retry(lambda: self.agent.prompt(message))
-        await self._compact_context_if_needed()
-        return result
+        self._prepare_memory_context(_full_text_from_user(message))
+        before_count = len(self.agent.state.messages)
+        try:
+            result = await self._run_with_retry(lambda: self.agent.prompt(message))
+            self._reflect_memory_from_new_messages(before_count)
+            await self._compact_context_if_needed()
+            return result
+        finally:
+            self._active_memory_context = None
 
     async def continue_run(self) -> list[AgentMessage]:
         await self._run_lifecycle_hooks(text="", is_continue=True, hooks=self.before_prompt_hooks)
+        before_count = len(self.agent.state.messages)
         result = await self._run_with_retry(self.agent.continue_run)
+        self._reflect_memory_from_new_messages(before_count)
         await self._compact_context_if_needed()
         await self._run_lifecycle_hooks(text="", is_continue=True, hooks=self.after_prompt_hooks)
         return result
@@ -195,6 +217,25 @@ class AgentSession:
 
     def list_entry_ids(self) -> list[str]:
         return self.store.list_entry_ids()
+
+    def list_memories(self, *, kind: str | None = None, limit: int = 50) -> list[dict]:
+        return [record.to_dict() for record in self.memory_store.list(kind=kind, limit=limit)]
+
+    def search_memories(self, query: str, *, limit: int = 10) -> list[dict]:
+        return [record.to_dict() for record in self.memory_store.search(query, limit=limit)]
+
+    def reflect_memories(self) -> list[dict]:
+        records = self.memory_reflector.reflect(list(self.agent.state.messages), session_id=self.session_id)
+        self.store.append_event(
+            {
+                "type": "memory_reflection",
+                "sessionId": self.session_id,
+                "created": len(records),
+                "memory_ids": [record.id for record in records],
+                "source": "manual",
+            }
+        )
+        return [record.to_dict() for record in records]
 
     def list_entries(self) -> list[dict]:
         return self.store.list_entries()
@@ -230,6 +271,8 @@ class AgentSession:
                 max_context_tokens=self.max_context_tokens,
                 retain_recent_messages=self.retain_recent_messages,
                 summary_builder=self.summary_builder,
+                auto_memory=self.auto_memory,
+                memory_prompt_limit=self.memory_prompt_limit,
                 retry_enabled=self.retry_enabled,
                 max_retries=self.max_retries,
                 retry_base_delay_ms=self.retry_base_delay_ms,
@@ -271,7 +314,11 @@ class AgentSession:
         self.artifact_store = ArtifactStore(self.workspace_dir, self.session_id)
         self.artifact_store.ensure_initialized()
         self.context_compressor = ContextCompressor(ToolResultCompactor(self.artifact_store))
+        self.memory_store = MemoryStore(self.workspace_dir)
+        self.memory_store.ensure_initialized()
+        self.memory_reflector = MemoryReflector(self.memory_store)
         self._logged_context_artifacts = set()
+        self._active_memory_context = None
         restored = new_store.load_session_messages()
         if not restored:
             restored = new_store.load_context_messages()
@@ -280,12 +327,71 @@ class AgentSession:
     def _create_store(self, session_id: str):
         return SessionStore(self.workspace_dir, session_id)
 
+    def _reflect_memory_from_new_messages(self, start_index: int) -> None:
+        if not self.auto_memory:
+            return
+        new_messages = list(self.agent.state.messages[start_index:])
+        if not new_messages:
+            return
+        records = self.memory_reflector.reflect(new_messages, session_id=self.session_id)
+        if not records:
+            return
+        self.store.append_event(
+            {
+                "type": "memory_reflection",
+                "sessionId": self.session_id,
+                "created": len(records),
+                "memory_ids": [record.id for record in records],
+                "source": "auto",
+            }
+        )
+
+    def _prepare_memory_context(self, query: str) -> None:
+        query = query.strip()
+        self._active_memory_context = None
+        if not query or self.memory_retrieval_limit <= 0:
+            return
+        records = self.memory_store.search(query, limit=self.memory_retrieval_limit)
+        if not records:
+            self.store.append_event(
+                {
+                    "type": "memory_retrieved",
+                    "sessionId": self.session_id,
+                    "query": query[:240],
+                    "matched_ids": [],
+                    "injected_count": 0,
+                }
+            )
+            return
+
+        lines = [
+            "[Relevant Long-Term Memory]",
+            "以下是与当前任务相关的长期记忆。优先参考，但如果和当前用户明确要求冲突，以当前用户要求为准。",
+        ]
+        for record in records:
+            tags = f" tags={','.join(record.tags[:4])}" if record.tags else ""
+            lines.append(f"- {record.id} [{record.kind}] {record.content}{tags}")
+        self._active_memory_context = UserMessage(content=[TextContent(text="\n".join(lines))])
+        self.store.append_event(
+            {
+                "type": "memory_retrieved",
+                "sessionId": self.session_id,
+                "query": query[:240],
+                "matched_ids": [record.id for record in records],
+                "injected_count": len(records),
+                "kinds": [record.kind for record in records],
+            }
+        )
+
     async def _transform_context_for_llm(
         self,
         messages: list[AgentMessage],
         signal: object | None,
     ) -> list[AgentMessage]:
         result = self.context_compressor.compress(messages)
+        transformed_messages = list(result.messages)
+        if self._active_memory_context is not None:
+            transformed_messages = self._inject_memory_context(transformed_messages, self._active_memory_context)
         for record in result.records:
             if record.artifact_id in self._logged_context_artifacts:
                 continue
@@ -302,7 +408,18 @@ class AgentSession:
                     "strategy": "tool_result_artifact",
                 }
             )
-        return result.messages  # type: ignore[return-value]
+        return transformed_messages  # type: ignore[return-value]
+
+    @staticmethod
+    def _inject_memory_context(messages: list[AgentMessage], memory_context: UserMessage) -> list[AgentMessage]:
+        if not messages:
+            return [memory_context]
+        insert_at = len(messages)
+        for idx in range(len(messages) - 1, -1, -1):
+            if isinstance(messages[idx], UserMessage):
+                insert_at = idx
+                break
+        return [*messages[:insert_at], memory_context, *messages[insert_at:]]
 
     def _install_artifact_read_guard(self) -> None:
         user_before = self._external_before_tool_call

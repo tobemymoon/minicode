@@ -48,6 +48,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-context-messages", type=int, default=None, help="Compaction message threshold")
     parser.add_argument("--max-context-tokens", type=int, default=None, help="Compaction token threshold (approx)")
     parser.add_argument("--retain-recent-messages", type=int, default=24, help="Keep recent messages when compacting")
+    parser.add_argument("--no-auto-memory", action="store_true", help="Disable automatic memory reflection")
+    parser.add_argument("--memory-prompt-limit", type=int, default=12, help="Maximum memories injected into system prompt")
     parser.add_argument("--no-retry", action="store_true", help="Disable automatic retry on transient errors")
     parser.add_argument("--max-retries", type=int, default=2, help="Maximum retry count")
     parser.add_argument("--retry-base-delay-ms", type=int, default=1200, help="Retry base delay in milliseconds")
@@ -94,6 +96,8 @@ async def _run_from_args(args: argparse.Namespace) -> int:
         max_context_messages=args.max_context_messages,
         max_context_tokens=args.max_context_tokens,
         retain_recent_messages=args.retain_recent_messages,
+        auto_memory=not bool(args.no_auto_memory),
+        memory_prompt_limit=args.memory_prompt_limit,
         retry_enabled=not bool(args.no_retry),
         max_retries=args.max_retries,
         retry_base_delay_ms=args.retry_base_delay_ms,

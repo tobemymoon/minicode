@@ -15,6 +15,7 @@ from .agent_session import AgentSession
 from .builtin_tools import READ_ONLY_TOOL_NAMES, create_builtin_tools
 from .convert_to_llm import convert_to_llm
 from .extensions import load_extensions, load_skills
+from .memory import MemoryStore
 from .mcp import RemoteMCPClient, create_mcp_proxy_tools, parse_mcp_tool_configs, parse_remote_mcp_server_configs
 from .resources import WorkspaceResourceLoader
 from .session_store import SessionStore
@@ -42,6 +43,13 @@ def _load_global_memory(workspace: Path) -> str:
         return ""
     try:
         return path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+
+def _load_evolving_memory(workspace: Path, *, limit: int) -> str:
+    try:
+        return MemoryStore(workspace).render_for_prompt(limit=limit).strip()
     except Exception:
         return ""
 
@@ -320,6 +328,9 @@ def create_agent_session(options: AgentSessionOptions | CreateAgentSessionOption
     markdown_memory = _load_global_memory(workspace)
     if markdown_memory:
         memory_sections.append(markdown_memory)
+    evolving_memory = _load_evolving_memory(workspace, limit=options.memory_prompt_limit)
+    if evolving_memory:
+        memory_sections.append("自进化记忆：\n" + evolving_memory)
     memory_text = "\n\n".join(memory_sections)
 
     system_prompt = build_system_prompt(
@@ -356,6 +367,8 @@ def create_agent_session(options: AgentSessionOptions | CreateAgentSessionOption
         max_context_tokens=max_context_tokens,
         retain_recent_messages=retain_recent_messages,
         summary_builder=options.summary_builder,
+        auto_memory=options.auto_memory,
+        memory_prompt_limit=options.memory_prompt_limit,
         retry_enabled=retry_enabled,
         max_retries=max_retries,
         retry_base_delay_ms=retry_base_delay_ms,

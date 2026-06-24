@@ -154,7 +154,25 @@ def _ensure_valid_sequence(messages: list[Message]) -> list[Message]:
             result.append(msg)
             continue
         prev = result[-1]
+        if isinstance(prev, UserMessage) and isinstance(msg, UserMessage):
+            result[-1] = _merge_user_messages(prev, msg)
+            continue
         if isinstance(prev, AssistantMessage) and isinstance(msg, AssistantMessage):
             continue
         result.append(msg)
     return result
+
+
+def _merge_user_messages(left: UserMessage, right: UserMessage) -> UserMessage:
+    content: list[TextContent | ImageContent] = []
+    content.extend(_user_content_blocks(left))
+    if content and any(isinstance(block, TextContent) and block.text.strip() for block in content):
+        content.append(TextContent(text="\n\n"))
+    content.extend(_user_content_blocks(right))
+    return UserMessage(content=content, timestamp=right.timestamp)
+
+
+def _user_content_blocks(message: UserMessage) -> list[TextContent | ImageContent]:
+    if isinstance(message.content, str):
+        return [TextContent(text=message.content)]
+    return [block for block in message.content if isinstance(block, (TextContent, ImageContent))]

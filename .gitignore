@@ -38,6 +38,7 @@ Thumbs.db
 # Runtime state
 .codeclaw/sessions/
 .codeclaw/artifacts/
+.codeclaw/memory/
 .xingclaw/sessions/
 .codex
 

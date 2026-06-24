@@ -191,25 +191,30 @@ async def _run_loop(
             if has_more_tool_calls:
                 tool_iterations += 1
                 if tool_iterations > max(1, config.max_tool_iterations):
-                    guard_message = ToolResultMessage(
-                        tool_call_id="tool_iteration_limit",
-                        tool_name="agent_loop",
-                        content=[
-                            TextContent(
-                                text=(
-                                    "Tool iteration limit reached. Stop calling tools and answer from the "
-                                    "available context, or explain what information is still missing."
+                    guard_results = [
+                        ToolResultMessage(
+                            tool_call_id=call.id,
+                            tool_name=call.name,
+                            content=[
+                                TextContent(
+                                    text=(
+                                        "Tool iteration limit reached. This tool call was not executed. "
+                                        "Stop calling tools and answer from the available context, or "
+                                        "explain what information is still missing."
+                                    )
                                 )
-                            )
-                        ],
-                        is_error=True,
-                        timestamp=_now_ms(),
-                    )
-                    current_context.messages.append(guard_message)
-                    new_messages.append(guard_message)
-                    await _emit(emit, {"type": "message_start", "message": guard_message})
-                    await _emit(emit, {"type": "message_end", "message": guard_message})
-                    await _emit(emit, {"type": "turn_end", "message": assistant, "toolResults": [guard_message]})
+                            ],
+                            is_error=True,
+                            timestamp=_now_ms(),
+                        )
+                        for call in tool_calls
+                    ]
+                    for guard_message in guard_results:
+                        current_context.messages.append(guard_message)
+                        new_messages.append(guard_message)
+                        await _emit(emit, {"type": "message_start", "message": guard_message})
+                        await _emit(emit, {"type": "message_end", "message": guard_message})
+                    await _emit(emit, {"type": "turn_end", "message": assistant, "toolResults": guard_results})
                     await _emit(emit, {"type": "turn_start"})
                     final_instruction = UserMessage(
                         content=[

@@ -156,6 +156,8 @@ def _create_fresh_session(old: AgentSession) -> AgentSession:
             max_context_tokens=old.max_context_tokens,
             retain_recent_messages=old.retain_recent_messages,
             summary_builder=old.summary_builder,
+            auto_memory=old.auto_memory,
+            memory_prompt_limit=old.memory_prompt_limit,
             retry_enabled=old.retry_enabled,
             max_retries=old.max_retries,
             retry_base_delay_ms=old.retry_base_delay_ms,
@@ -213,6 +215,9 @@ async def _handle_interactive_command(
     if cmd == "/usage":
         output(_format_usage(session))
         return True, None
+    if cmd == "/memory":
+        _handle_memory_command(session, arg, output=output)
+        return True, None
     if cmd == "/tree":
         entries = session.list_entries()
         if not entries:
@@ -260,6 +265,37 @@ async def _handle_interactive_command(
             output(str(value))
         return True, None
     return False, None
+
+
+def _handle_memory_command(session: AgentSession, arg: str, *, output: OutputFn = print) -> None:
+    action, _, rest = arg.partition(" ")
+    action = action.strip() or "list"
+    rest = rest.strip()
+
+    if action == "list":
+        records = session.list_memories(limit=20)
+    elif action == "search":
+        if not rest:
+            output("usage: /memory search <query>")
+            return
+        records = session.search_memories(rest, limit=20)
+    elif action == "reflect":
+        records = session.reflect_memories()
+        if not records:
+            output("(no new memories)")
+            return
+        output(f"created={len(records)}")
+    else:
+        output("usage: /memory list | /memory search <query> | /memory reflect")
+        return
+
+    if not records:
+        output("(empty)")
+        return
+    for item in records:
+        tags = ",".join(item.get("tags", [])[:4])
+        suffix = f" tags={tags}" if tags else ""
+        output(f"- {item.get('id')} [{item.get('kind')}] {item.get('content')}{suffix}")
 
 
 async def run(options: RunOptions) -> AssistantMessage | None:

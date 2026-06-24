@@ -16,6 +16,7 @@ from .convert_to_llm import convert_to_llm
 from .extensions import discover_extension_paths, discover_skill_paths, load_extensions, load_skills
 from .factory import create_agent_session
 from .mcp import create_mcp_proxy_tools, parse_mcp_tool_configs
+from .memory import MemoryRecord, MemoryReflector, MemoryStore
 from .runner import RunOptions, run, run_interactive, run_print, run_rpc
 from .resources import WorkspaceResourceLoader, WorkspaceResources, WorkspaceSettings
 from .session_store import SessionStore, new_session_id
@@ -45,6 +46,9 @@ __all__ = [
     "list_runtime_commands",
     "parse_mcp_tool_configs",
     "create_mcp_proxy_tools",
+    "MemoryRecord",
+    "MemoryReflector",
+    "MemoryStore",
     "build_parser",
     "main",
     "RunOptions",
