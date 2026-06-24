@@ -1,0 +1,3 @@
+hi agent
+你好 ToolCall
+hi memory
