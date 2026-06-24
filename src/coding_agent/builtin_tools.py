@@ -97,6 +97,7 @@ def create_builtin_tools(
     edit_require_unique_match: bool = True,
 ) -> list[AgentTool]:
     workspace = Path(workspace_dir)
+    workspace_root = workspace.resolve()
     artifact_store = ArtifactStore(workspace)
     enabled = set(enabled_names) if enabled_names else None
 
@@ -128,6 +129,7 @@ def create_builtin_tools(
     async def read_tool(tool_call_id: str, params: dict[str, Any], signal=None, on_update=None) -> AgentToolResult:
         _ = tool_call_id, signal, on_update
         path_text = str(params.get("path", ""))
+        offset = max(0, int(params.get("offset", 0)))
         max_chars = int(params.get("max_chars", 4000))
         if not path_text:
             return AgentToolResult(content=[TextContent(text="Missing path")], details={})
@@ -138,9 +140,20 @@ def create_builtin_tools(
             return AgentToolResult(content=[TextContent(text=f"Not a file: {path_text}")], details={})
 
         text = target.read_text(encoding="utf-8", errors="replace")
-        if len(text) > max_chars:
-            text = text[:max_chars] + "\n...<truncated>..."
-        return AgentToolResult(content=[TextContent(text=text)], details={})
+        chunk = text[offset : offset + max_chars]
+        if offset + len(chunk) < len(text):
+            chunk = chunk + "\n...<truncated>..."
+        return AgentToolResult(
+            content=[TextContent(text=chunk)],
+            details={
+                "path": path_text,
+                "offset": offset,
+                "max_chars": max_chars,
+                "returned_chars": len(chunk),
+                "total_chars": len(text),
+                "has_more": offset + len(chunk) < len(text),
+            },
+        )
 
     async def read_artifact_tool(tool_call_id: str, params: dict[str, Any], signal=None, on_update=None) -> AgentToolResult:
         _ = tool_call_id, signal, on_update
@@ -276,7 +289,7 @@ def create_builtin_tools(
             return AgentToolResult(content=[TextContent(text=f"Invalid regex: {exc}")], details={})
 
         matches: list[str] = []
-        files = [p for p in root.glob(glob_pattern) if p.is_file()]
+        files = [root] if root.is_file() else [p for p in root.glob(glob_pattern) if p.is_file()]
         for file_path in files:
             try:
                 text = file_path.read_text(encoding="utf-8", errors="replace")
@@ -284,7 +297,7 @@ def create_builtin_tools(
                 continue
             for idx, line in enumerate(text.splitlines(), start=1):
                 if regex.search(line):
-                    rel = file_path.relative_to(workspace).as_posix()
+                    rel = file_path.resolve().relative_to(workspace_root).as_posix()
                     matches.append(f"{rel}:{idx}:{line[:220]}")
                     if len(matches) >= max_matches:
                         break
@@ -306,8 +319,9 @@ def create_builtin_tools(
             return AgentToolResult(content=[TextContent(text=f"Path not found: {start_path}")], details={})
 
         results = []
-        for path in root.glob(pattern):
-            rel = path.relative_to(workspace).as_posix()
+        paths = [root] if root.is_file() else root.glob(pattern)
+        for path in paths:
+            rel = path.resolve().relative_to(workspace_root).as_posix()
             results.append(rel + ("/" if path.is_dir() else ""))
             if len(results) >= max_results:
                 break
@@ -429,6 +443,7 @@ def create_builtin_tools(
                     "type": "object",
                     "properties": {
                         "path": {"type": "string", "description": "相对 workspace 的文件路径"},
+                        "offset": {"type": "number", "description": "从第几个字符开始读取，默认 0"},
                         "max_chars": {"type": "number", "description": "最大返回字符数，默认 4000"},
                     },
                     "required": ["path"],
@@ -447,6 +462,7 @@ def create_builtin_tools(
                     "type": "object",
                     "properties": {
                         "path": {"type": "string", "description": "相对 workspace 的文件路径"},
+                        "offset": {"type": "number", "description": "从第几个字符开始读取，默认 0"},
                         "max_chars": {"type": "number", "description": "最大返回字符数，默认 4000"},
                     },
                     "required": ["path"],

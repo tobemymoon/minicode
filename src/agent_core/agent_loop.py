@@ -21,6 +21,7 @@ from ai.types import (
     TextContent,
     ToolCall,
     ToolResultMessage,
+    UserMessage,
 )
 
 from .types import (
@@ -209,6 +210,30 @@ async def _run_loop(
                     await _emit(emit, {"type": "message_start", "message": guard_message})
                     await _emit(emit, {"type": "message_end", "message": guard_message})
                     await _emit(emit, {"type": "turn_end", "message": assistant, "toolResults": [guard_message]})
+                    await _emit(emit, {"type": "turn_start"})
+                    final_instruction = UserMessage(
+                        content=[
+                            TextContent(
+                                text=(
+                                    "Tool iteration limit reached. Do not call tools again. "
+                                    "Answer the user's original request using only the available context. "
+                                    "If some details are missing, say so briefly."
+                                )
+                            )
+                        ],
+                    )
+                    current_context.messages.append(final_instruction)
+                    new_messages.append(final_instruction)
+                    await _emit(emit, {"type": "message_start", "message": final_instruction})
+                    await _emit(emit, {"type": "message_end", "message": final_instruction})
+                    final_context = AgentContext(
+                        system_prompt=current_context.system_prompt,
+                        messages=list(current_context.messages),
+                        tools=[],
+                    )
+                    final_assistant = await _stream_assistant_response(final_context, config, emit, signal, stream_fn)
+                    new_messages.append(final_assistant)
+                    await _emit(emit, {"type": "turn_end", "message": final_assistant, "toolResults": []})
                     await _emit(emit, {"type": "agent_end", "messages": new_messages})
                     return
                 tool_results = await _execute_tool_calls(current_context, assistant, config, emit, signal)

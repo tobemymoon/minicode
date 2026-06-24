@@ -14,6 +14,7 @@ from pathlib import Path
 import asyncio
 import inspect
 import logging
+import re
 import uuid
 from typing import Awaitable, Callable
 
@@ -410,6 +411,13 @@ class AgentSession:
         if not summary_text:
             summary_text = self._fallback_summary(older)
 
+        quality = self._assess_summary_coverage(older, summary_text)
+        if quality["missing_total"] > 0:
+            patch_text = self._build_summary_coverage_patch(quality)
+            if patch_text:
+                summary_text = f"{summary_text}\n\n{patch_text}".strip()
+                quality = self._assess_summary_coverage(older, summary_text)
+
         summary_id = f"sum_{uuid.uuid4().hex[:10]}"
         summary_message = UserMessage(
             content=[
@@ -438,6 +446,7 @@ class AgentSession:
                 "covered_message_count": len(older),
                 "retained_recent": len(recent),
                 "estimated_tokens_before": estimated_tokens,
+                "quality": quality,
                 "summary": summary_text,
             }
         )
@@ -450,6 +459,7 @@ class AgentSession:
                 "after_count": len(compacted),
                 "retained_recent": len(recent),
                 "estimated_tokens_before": estimated_tokens,
+                "summary_quality": quality,
                 "reason": "overflow" if force else ("token_threshold" if over_token_limit else "message_threshold"),
             }
         )
@@ -511,6 +521,60 @@ class AgentSession:
         if len(summary) > 4000:
             summary = summary[:4000].rstrip() + "\n...<structured summary truncated>..."
         return summary
+
+    @staticmethod
+    def _assess_summary_coverage(messages: list[Message], summary_text: str) -> dict[str, object]:
+        entities = _extract_summary_entities(messages)
+        summary_lower = summary_text.lower()
+        missing: dict[str, list[str]] = {}
+        total = 0
+        covered = 0
+
+        for key, values in entities.items():
+            total += len(values)
+            key_missing: list[str] = []
+            for value in values:
+                if value.lower() in summary_lower:
+                    covered += 1
+                else:
+                    key_missing.append(value)
+            missing[key] = key_missing
+
+        score = 1.0 if total == 0 else covered / total
+        missing_total = total - covered
+        return {
+            "score": round(score, 4),
+            "covered": covered,
+            "total": total,
+            "missing_total": missing_total,
+            "missing": missing,
+        }
+
+    @staticmethod
+    def _build_summary_coverage_patch(quality: dict[str, object]) -> str:
+        missing_raw = quality.get("missing")
+        if not isinstance(missing_raw, dict):
+            return ""
+
+        labels = {
+            "paths": "Paths",
+            "symbols": "Symbols",
+            "artifacts": "Artifacts",
+            "constraints": "Constraints",
+            "tools": "Tools",
+        }
+        lines = ["## Coverage Patch"]
+        added = False
+        for key in ("paths", "symbols", "artifacts", "constraints", "tools"):
+            values = missing_raw.get(key)
+            if not isinstance(values, list) or not values:
+                continue
+            clean_values = [str(item) for item in values[:12] if str(item).strip()]
+            if not clean_values:
+                continue
+            lines.append(f"- {labels[key]}: {', '.join(clean_values)}")
+            added = True
+        return "\n".join(lines) if added else ""
 
     async def _llm_summary(self, messages: list[Message]) -> str:
         """用 LLM 生成上下文摘要。"""
@@ -638,3 +702,96 @@ def _extract_text_from_assistant(message: AssistantMessage) -> str:
 def _extract_text_from_tool_result(message: ToolResultMessage) -> str:
     text = "".join(block.text for block in message.content if isinstance(block, TextContent))
     return text[:180]
+
+
+def _extract_summary_entities(messages: list[Message]) -> dict[str, list[str]]:
+    raw_texts: list[str] = []
+    user_texts: list[str] = []
+    tool_names: set[str] = set()
+
+    for message in messages:
+        if isinstance(message, UserMessage):
+            text = _full_text_from_user(message)
+            if text:
+                raw_texts.append(text)
+                user_texts.append(text)
+        elif isinstance(message, AssistantMessage):
+            text = _full_text_from_assistant(message)
+            if text:
+                raw_texts.append(text)
+            for block in message.content:
+                if isinstance(block, ToolCall):
+                    tool_names.add(block.name)
+                    raw_texts.append(f"{block.name} {block.arguments}")
+        elif isinstance(message, ToolResultMessage):
+            tool_names.add(message.tool_name)
+            text = _full_text_from_tool_result(message)
+            if text:
+                raw_texts.append(text)
+            if isinstance(message.details, dict):
+                raw_texts.append(str(message.details))
+
+    combined = "\n".join(raw_texts)
+    paths = _unique_limited(
+        re.findall(r"(?<![\w/.-])[\w./-]+\.(?:py|md|json|toml|txt|yaml|yml|csv|tsv)(?![\w/.-])", combined),
+        limit=16,
+    )
+    symbols = _unique_limited(
+        [
+            *re.findall(r"\b(?:def|class)\s+([A-Za-z_]\w*)", combined),
+            *re.findall(r"\b([A-Za-z_]\w*)\s*\(", combined),
+        ],
+        limit=16,
+    )
+    artifacts = _unique_limited(re.findall(r"\bart_[a-f0-9]{16}\b", combined), limit=8)
+    constraints = _extract_user_constraints(user_texts)
+
+    return {
+        "paths": paths,
+        "symbols": symbols,
+        "artifacts": artifacts,
+        "constraints": constraints,
+        "tools": _unique_limited(sorted(tool_names), limit=12),
+    }
+
+
+def _full_text_from_user(message: UserMessage) -> str:
+    if isinstance(message.content, str):
+        return message.content
+    return "".join(block.text for block in message.content if isinstance(block, TextContent))
+
+
+def _full_text_from_assistant(message: AssistantMessage) -> str:
+    return "".join(block.text for block in message.content if isinstance(block, TextContent))
+
+
+def _full_text_from_tool_result(message: ToolResultMessage) -> str:
+    return "".join(block.text for block in message.content if isinstance(block, TextContent))
+
+
+def _extract_user_constraints(user_texts: list[str]) -> list[str]:
+    constraints: list[str] = []
+    keywords = ("要求", "必须", "不要", "不能", "需要", "希望", "优先", "禁止", "保留", "删除")
+    for text in user_texts:
+        chunks = re.split(r"[\n。！？!?；;]", text)
+        for chunk in chunks:
+            clean = re.sub(r"\s+", " ", chunk).strip()
+            if not clean or len(clean) > 140:
+                continue
+            if any(keyword in clean for keyword in keywords):
+                constraints.append(clean)
+    return _unique_limited(constraints, limit=12)
+
+
+def _unique_limited(values: list[str], *, limit: int) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        clean = str(value).strip().strip("'\"`")
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        out.append(clean)
+        if len(out) >= limit:
+            break
+    return out
