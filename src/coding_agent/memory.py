@@ -138,7 +138,7 @@ class MemoryStore:
         scored: list[tuple[int, MemoryRecord]] = []
         for record in self.list(limit=1000):
             haystack = " ".join([record.content, *record.tags]).lower()
-            score = sum(1 for term in terms if term.lower() in haystack)
+            score = sum(_term_score(term, haystack) for term in terms)
             if score:
                 scored.append((score, record))
         scored.sort(key=lambda item: (item[0], item[1].updated_at), reverse=True)
@@ -212,6 +212,8 @@ class MemoryReflector:
         for chunk in re.split(r"[\n。！？!?；;]", text):
             clean = re.sub(r"\s+", " ", chunk).strip()
             if not clean or len(clean) > 180:
+                continue
+            if _looks_like_question(clean):
                 continue
             if any(marker in clean for marker in markers):
                 record = self.store.add(
@@ -320,6 +322,30 @@ def _keywords(text: str) -> list[str]:
     ]
     stop = {"the", "and", "for", "with", "from", "this", "that", "用户", "任务", "工具", "文件"}
     return [item for item in _unique(candidates, limit=40) if item.lower() not in stop]
+
+
+def _term_score(term: str, haystack: str) -> int:
+    term_lower = term.lower()
+    if term_lower in haystack:
+        return 3
+    if re.search(r"[\u4e00-\u9fff]", term):
+        grams = _chinese_grams(term, size=2)
+        hits = sum(1 for gram in grams if gram in haystack)
+        if hits:
+            return min(2, hits)
+    return 0
+
+
+def _chinese_grams(text: str, *, size: int) -> list[str]:
+    chars = re.findall(r"[\u4e00-\u9fff]", text)
+    if len(chars) < size:
+        return []
+    return ["".join(chars[i : i + size]) for i in range(len(chars) - size + 1)]
+
+
+def _looks_like_question(text: str) -> bool:
+    question_markers = ("吗", "么", "怎么", "为什么", "是什么", "咋", "如何", "能不能", "可不可以", "会不会")
+    return any(marker in text for marker in question_markers)
 
 
 def _unique(values: list[str], *, limit: int) -> list[str]:

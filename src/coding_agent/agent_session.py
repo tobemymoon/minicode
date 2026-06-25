@@ -351,7 +351,7 @@ class AgentSession:
         self._active_memory_context = None
         if not query or self.memory_retrieval_limit <= 0:
             return
-        records = self.memory_store.search(query, limit=self.memory_retrieval_limit)
+        records = self._retrieve_relevant_memories(query)
         if not records:
             self.store.append_event(
                 {
@@ -382,6 +382,30 @@ class AgentSession:
                 "kinds": [record.kind for record in records],
             }
         )
+
+    def _retrieve_relevant_memories(self, query: str) -> list:
+        records = self.memory_store.search(query, limit=self.memory_retrieval_limit)
+        seen = {record.id for record in records}
+
+        # User preferences are lightweight and broadly useful, so keep a few as fallback.
+        for record in self.memory_store.list(kind="preference", limit=3):
+            if record.id in seen:
+                continue
+            records.append(record)
+            seen.add(record.id)
+            if len(records) >= self.memory_retrieval_limit:
+                break
+
+        if any(marker in query.lower() for marker in ("error", "traceback", "exception", "报错", "失败", "400")):
+            for record in self.memory_store.list(kind="error_fix", limit=5):
+                if record.id in seen:
+                    continue
+                records.append(record)
+                seen.add(record.id)
+                if len(records) >= self.memory_retrieval_limit:
+                    break
+
+        return records[: self.memory_retrieval_limit]
 
     async def _transform_context_for_llm(
         self,
