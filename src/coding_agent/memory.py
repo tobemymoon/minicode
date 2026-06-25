@@ -342,19 +342,19 @@ class MemoryReflector:
         *,
         source: dict[str, Any],
     ) -> MemoryRecord | None:
-        errors = [r for r in tool_results if r.is_error]
-        if not errors:
+        errors = [r for r in tool_results if r.is_error or _looks_like_error_tool_result(r)]
+        combined_assistant = "\n".join(assistant_texts)
+        err_text = _text_from_tool_result(errors[-1]) if errors else _extract_error_excerpt(combined_assistant)
+        if not err_text:
             return None
-        final = assistant_texts[-1] if assistant_texts else ""
-        if not any(marker in final for marker in ("修复", "解决", "原因", "通过", "成功")):
+        if not any(marker in combined_assistant for marker in ("修复", "解决", "原因", "处理", "下次", "错误", "排查", "FileNotFoundError")):
             return None
         goal = user_texts[-1] if user_texts else "未知任务"
-        err_text = _text_from_tool_result(errors[-1])
-        content = f"错误修复经验：任务“{goal[:100]}”中出现错误“{err_text[:120]}”，后续处理结论：{final[:180]}"
+        content = f"错误修复经验：任务“{goal[:100]}”中出现错误“{err_text[:160]}”，后续处理结论：{_clip(combined_assistant, 220)}"
         return self.store.add(
             kind="error_fix",
             content=content,
-            tags=["error_fix", *_keywords(goal)[:4]],
+            tags=["error_fix", *_keywords(goal)[:4], *_keywords(err_text)[:4]],
             source={**source, "extractor": "error_fix_rules"},
             confidence=0.72,
         )
@@ -449,6 +449,52 @@ def _text_from_assistant(message: AssistantMessage) -> str:
 
 def _text_from_tool_result(message: ToolResultMessage) -> str:
     return "".join(block.text for block in message.content if isinstance(block, TextContent))
+
+
+def _looks_like_error_tool_result(message: ToolResultMessage) -> bool:
+    details = message.details if isinstance(message.details, dict) else {}
+    exit_code = details.get("exit_code")
+    try:
+        if exit_code is not None and int(exit_code) != 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    if details.get("error") or details.get("timeout") or details.get("blocked"):
+        return True
+    text = _text_from_tool_result(message).lower()
+    markers = (
+        "traceback",
+        "filenotfounderror",
+        "no such file",
+        "no such file or directory",
+        "command failed",
+        "error:",
+        "[stderr]",
+        "报错",
+        "错误",
+        "失败",
+        "不存在",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _extract_error_excerpt(text: str) -> str:
+    if not text:
+        return ""
+    patterns = [
+        r"python: can't open file [^\n]+",
+        r"FileNotFoundError[^\n]*",
+        r"No such file or directory[^\n]*",
+        r"没有那个文件或目录[^\n]*",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.I)
+        if match:
+            return _clip(match.group(0), 220)
+    lowered = text.lower()
+    if any(marker in lowered for marker in ("filenotfounderror", "no such file", "不存在", "文件路径错误")):
+        return _clip(text, 220)
+    return ""
 
 
 def _tool_names(messages: list[Message]) -> list[str]:

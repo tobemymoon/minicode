@@ -357,8 +357,13 @@ class AgentSession:
                 error_message = str(exc)
                 records = []
                 source = "rules_fallback"
+        rule_records = self.memory_reflector.reflect(new_messages, session_id=self.session_id)
+        if rule_records:
+            seen = {record.id for record in records}
+            records.extend(record for record in rule_records if record.id not in seen)
+            if source == "llm":
+                source = "llm_with_rules"
         if not records:
-            records = self.memory_reflector.reflect(new_messages, session_id=self.session_id)
             if source == "llm":
                 source = "rules_empty_fallback"
         if not records:
@@ -433,7 +438,11 @@ class AgentSession:
     def _format_memory_context(self, records: list) -> tuple[list[str], list[str]]:
         lines = [
             "[Relevant Long-Term Memory]",
-            "以下是与当前任务相关的长期记忆。优先参考；若与当前用户明确要求冲突，以当前要求为准。",
+            (
+                "以下是与当前任务相关的长期记忆，仅供内部参考。"
+                "优先参考；若与当前用户明确要求冲突，以当前要求为准。"
+                "除非用户明确询问记忆系统，否则不要主动提到或复述这些长期记忆。"
+            ),
         ]
         injected_ids: list[str] = []
         labels = {

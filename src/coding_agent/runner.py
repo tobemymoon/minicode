@@ -12,7 +12,9 @@ from dataclasses import dataclass, field
 from dataclasses import asdict, is_dataclass
 import inspect
 import json
+import os
 import sys
+import time
 from typing import Any, Callable
 
 from ai.types import AssistantMessage, TextContent
@@ -39,6 +41,97 @@ def _extract_assistant_text(message: AssistantMessage) -> str:
     return "".join(block.text for block in message.content if isinstance(block, TextContent)).strip()
 
 
+_ANSI = {
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+    "dim": "\033[2m",
+    "cyan": "\033[36m",
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+    "red": "\033[31m",
+    "blue": "\033[34m",
+    "magenta": "\033[35m",
+    "clear_line": "\033[2K",
+}
+
+
+def _ansi_enabled(output: OutputFn) -> bool:
+    return output is print and sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def _style(text: str, style: str, enabled: bool) -> str:
+    if not enabled:
+        return text
+    return f"{_ANSI.get(style, '')}{text}{_ANSI['reset']}"
+
+
+def _welcome(session: AgentSession, *, ansi: bool) -> str:
+    title = _style("CodeClaw", "bold", ansi)
+    meta = (
+        f"session={session.session_id}  "
+        f"model={session.agent.state.model.id}  "
+        f"provider={session.agent.state.model.provider}"
+    )
+    hint = "Ask anything, or type /help for commands. exit to quit."
+    line = _style("─" * 72, "dim", ansi)
+    return "\n".join([line, f"{title}  {_style('AI coding agent', 'dim', ansi)}", _style(meta, "dim", ansi), _style(hint, "dim", ansi), line])
+
+
+def _assistant_header(*, ansi: bool) -> str:
+    return f"\n{_style('CodeClaw', 'blue', ansi)}\n"
+
+
+def _truncate(text: str, limit: int = 80) -> str:
+    text = " ".join(str(text).split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _tool_label(name: str, args: dict[str, Any] | None = None) -> str:
+    args = args or {}
+    if name in {"read", "read_file", "write", "write_file", "edit", "ls", "list_dir"}:
+        path = args.get("path")
+        return f"{name} {path}" if path else name
+    if name == "grep":
+        pattern = args.get("pattern", "")
+        path = args.get("path", ".")
+        return f"grep {_truncate(pattern, 32)} in {path}"
+    if name == "find":
+        pattern = args.get("pattern") or args.get("glob") or args.get("name") or ""
+        return f"find {_truncate(pattern, 42)}".strip()
+    if name == "bash":
+        return f"bash {_truncate(str(args.get('command', '')), 64)}"
+    if name == "read_artifact":
+        return f"read_artifact {args.get('artifact_id', '')}".strip()
+    if name == "search_artifact":
+        query = args.get("query", "")
+        return f"search_artifact {_truncate(query, 40)}"
+    return name
+
+
+def _format_tool_event(event: AgentEvent, *, ansi: bool, label: str | None = None, elapsed: float | None = None) -> str:
+    name = str(event.get("toolName", "") or "(unknown)")
+    label = label or _tool_label(name, event.get("args") if isinstance(event.get("args"), dict) else None)
+    if event["type"] == "tool_execution_start":
+        return f"  {_style('>', 'dim', ansi)} {_style(label, 'cyan', ansi)} {_style('running', 'yellow', ansi)}"
+    status = "failed" if event.get("isError") else "done"
+    color = "red" if event.get("isError") else "green"
+    suffix = f" {_style(f'{elapsed:.1f}s', 'dim', ansi)}" if elapsed is not None else ""
+    return f"  {_style('>', 'dim', ansi)} {_style(label, 'cyan', ansi)} {_style(status, color, ansi)}{suffix}"
+
+
+def _format_assistant_status(message: AssistantMessage, *, ansi: bool) -> str:
+    stop = message.stop_reason or "unknown"
+    if stop == "stop" and not message.error_message:
+        return ""
+    color = "red" if stop == "error" else "dim"
+    lines = [f"{_style('status', 'dim', ansi)} {_style(stop, color, ansi)}"]
+    if message.error_message:
+        lines.append(f"{_style('error', 'red', ansi)} {message.error_message}")
+    return "\n".join(lines)
+
+
 async def run_print(
     session: AgentSession,
     prompt: str,
@@ -55,17 +148,50 @@ async def run_print(
 
     deltas: list[str] = []
     streamed_to_stdout = False
+    assistant_started = False
     stream_to_stdout = output is print
+    ansi = _ansi_enabled(output)
+    tool_labels: dict[str, str] = {}
+    tool_started_at: dict[str, float] = {}
+    tool_line_open = False
 
     def on_event(event: AgentEvent) -> None:
-        nonlocal streamed_to_stdout
+        nonlocal assistant_started, streamed_to_stdout, tool_line_open
         t = event["type"]
         if show_tool_events and t in {"tool_execution_start", "tool_execution_end"}:
+            tool_call_id = str(event.get("toolCallId", ""))
             if streamed_to_stdout:
                 sys.stdout.write("\n")
                 sys.stdout.flush()
                 streamed_to_stdout = False
-            output(f"[tool-event] {t}: {event.get('toolName', '')}")
+            if t == "tool_execution_start":
+                label = _tool_label(
+                    str(event.get("toolName", "") or "(unknown)"),
+                    event.get("args") if isinstance(event.get("args"), dict) else None,
+                )
+                tool_labels[tool_call_id] = label
+                tool_started_at[tool_call_id] = time.monotonic()
+                line = _format_tool_event(event, ansi=ansi, label=label)
+                if stream_to_stdout and ansi:
+                    if tool_line_open:
+                        sys.stdout.write("\n")
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                    tool_line_open = True
+                else:
+                    output(line)
+                return
+
+            label = tool_labels.get(tool_call_id)
+            started = tool_started_at.get(tool_call_id)
+            elapsed = time.monotonic() - started if started is not None else None
+            line = _format_tool_event(event, ansi=ansi, label=label, elapsed=elapsed)
+            if stream_to_stdout and ansi and tool_line_open:
+                sys.stdout.write(f"\r{_ANSI['clear_line']}{line}\n")
+                sys.stdout.flush()
+                tool_line_open = False
+            else:
+                output(line)
             return
 
         if t == "message_update":
@@ -74,6 +200,9 @@ async def run_print(
                 delta = str(assistant_event.get("delta", ""))
                 deltas.append(delta)
                 if stream_to_stdout and delta:
+                    if not assistant_started:
+                        sys.stdout.write(_assistant_header(ansi=ansi))
+                        assistant_started = True
                     sys.stdout.write(delta)
                     sys.stdout.flush()
                     streamed_to_stdout = True
@@ -90,13 +219,16 @@ async def run_print(
         sys.stdout.write("\n")
         sys.stdout.flush()
     elif deltas:
+        output(_assistant_header(ansi=ansi).rstrip())
         output("".join(deltas).strip())
     elif final_assistant is not None:
+        output(_assistant_header(ansi=ansi).rstrip())
         output(_extract_assistant_text(final_assistant) or "(empty)")
 
     if final_assistant is not None:
-        output(f"[assistant.stop_reason] {final_assistant.stop_reason}")
-        output(f"[assistant.error_message] {final_assistant.error_message}")
+        status_text = _format_assistant_status(final_assistant, ansi=ansi)
+        if status_text:
+            output(status_text)
     return final_assistant
 
 
@@ -113,14 +245,14 @@ async def run_interactive(
     持续读取输入并执行 prompt，直到命中退出命令。
     """
 
-    output("Entering interactive mode. Type 'exit' or '/exit' to quit.")
-    output(format_commands_for_help(session))
+    ansi = _ansi_enabled(output)
+    output(_welcome(session, ansi=ansi))
     current_session = session
     while True:
-        text = input_fn("you> ").strip()
+        text = input_fn(_style("you> ", "cyan", ansi)).strip()
         bare = text.lstrip("/")
         if bare in exit_commands:
-            output("Bye.")
+            output(_style("Bye.", "dim", ansi))
             return
         if not text:
             continue
@@ -265,6 +397,9 @@ async def _handle_interactive_command(
         if inspect.isawaitable(value):
             value = await value
         if value:
+            if reg.source == "skill":
+                await run_print(session, str(value), output=output)
+                return True, None
             output(str(value))
         return True, None
     return False, None

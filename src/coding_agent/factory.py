@@ -15,7 +15,6 @@ from .agent_session import AgentSession
 from .builtin_tools import READ_ONLY_TOOL_NAMES, create_builtin_tools
 from .convert_to_llm import convert_to_llm
 from .extensions import load_extensions, load_skills
-from .memory import MemoryStore
 from .mcp import RemoteMCPClient, create_mcp_proxy_tools, parse_mcp_tool_configs, parse_remote_mcp_server_configs
 from .resources import WorkspaceResourceLoader
 from .session_store import SessionStore
@@ -43,13 +42,6 @@ def _load_global_memory(workspace: Path) -> str:
         return ""
     try:
         return path.read_text(encoding="utf-8").strip()
-    except Exception:
-        return ""
-
-
-def _load_evolving_memory(workspace: Path, *, limit: int) -> str:
-    try:
-        return MemoryStore(workspace).render_for_prompt(limit=limit).strip()
     except Exception:
         return ""
 
@@ -91,13 +83,10 @@ def _compose_after_tool_call(
 ):
     chain: list[
         Callable[[AfterToolCallContext, Any | None], AfterToolCallResult | None | Awaitable[AfterToolCallResult | None]]
-    ] = []
+    ] = [_mark_failed_bash_as_error]
     if base:
         chain.append(base)
     chain.extend(hooks)
-    if not chain:
-        return None
-
     async def _runner(ctx: AfterToolCallContext, signal: Any | None):
         final = AfterToolCallResult()
         for hook in chain:
@@ -120,6 +109,23 @@ def _compose_after_tool_call(
         return final
 
     return _runner
+
+
+def _mark_failed_bash_as_error(ctx: AfterToolCallContext, signal: Any | None) -> AfterToolCallResult | None:
+    _ = signal
+    if ctx.tool_call.name != "bash":
+        return None
+    details = ctx.result.details
+    if not isinstance(details, dict):
+        return None
+    exit_code = details.get("exit_code")
+    try:
+        failed = int(exit_code) != 0
+    except (TypeError, ValueError):
+        return None
+    if not failed:
+        return None
+    return AfterToolCallResult(is_error=True)
 
 
 def _compose_lifecycle_hooks(
@@ -328,9 +334,6 @@ def create_agent_session(options: AgentSessionOptions | CreateAgentSessionOption
     markdown_memory = _load_global_memory(workspace)
     if markdown_memory:
         memory_sections.append(markdown_memory)
-    evolving_memory = _load_evolving_memory(workspace, limit=options.memory_prompt_limit)
-    if evolving_memory:
-        memory_sections.append("自进化记忆：\n" + evolving_memory)
     memory_text = "\n\n".join(memory_sections)
 
     system_prompt = build_system_prompt(
