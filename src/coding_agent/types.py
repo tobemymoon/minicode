@@ -48,7 +48,10 @@ class AgentSessionOptions:
     retain_recent_messages: int = 24
     summary_builder: Optional[Callable[[list[Message]], str]] = None
     auto_memory: bool = True
+    llm_memory_reflection: bool = True
+    max_memory_reflection_items: int = 3
     memory_prompt_limit: int = 12
+    memory_injection_char_budget: int = 1600
     retry_enabled: bool = True
     max_retries: int = 2
     retry_base_delay_ms: int = 1200
@@ -110,7 +113,10 @@ class CreateAgentSessionOptions:
     retain_recent_messages: int = 24
     summary_builder: Optional[Callable[[list[Message]], str]] = None
     auto_memory: bool = True
+    llm_memory_reflection: bool = True
+    max_memory_reflection_items: int = 3
     memory_prompt_limit: int = 12
+    memory_injection_char_budget: int = 1600
     retry_enabled: bool = True
     max_retries: int = 2
     retry_base_delay_ms: int = 1200

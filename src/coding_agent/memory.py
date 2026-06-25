@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 """
-自进化长期记忆 V1。
+自进化长期记忆 V2。
 
-设计目标：先把“执行-反思-提炼-分类存储-索引更新-按需复用”闭环跑通。
-存储使用文件系统 + JSONL，方便直接检查和面试讲解。
+设计目标：
+1. LLM 反思优先，规则反思兜底；
+2. 分类存储、准入过滤、去重合并和索引更新；
+3. 按需检索、使用次数更新和预算化注入。
 """
 
 import hashlib
@@ -15,7 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from ai.types import AssistantMessage, Message, TextContent, ToolCall, ToolResultMessage, UserMessage
+from ai.stream import complete_simple
+from ai.types import AssistantMessage, Context, Message, Model, SimpleStreamOptions, TextContent, ToolCall, ToolResultMessage, UserMessage
 
 MemoryKind = Literal["preference", "procedural", "error_fix", "project_fact"]
 
@@ -44,6 +47,7 @@ class MemoryRecord:
     use_count: int = 0
     created_at: str = ""
     updated_at: str = ""
+    last_used_at: str = ""
     fingerprint: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -61,6 +65,7 @@ class MemoryRecord:
             use_count=int(data.get("use_count", 0)),
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),
+            last_used_at=str(data.get("last_used_at", "")),
             fingerprint=str(data.get("fingerprint", "")),
         )
 
@@ -111,7 +116,11 @@ class MemoryStore:
         fp = _fingerprint(kind, clean)
         existing = self._by_fingerprint(fp)
         if existing:
-            return None
+            return self._merge_existing(existing.id, tags=tags, source=source, confidence=confidence)
+
+        similar = self._find_similar(kind, clean)
+        if similar:
+            return self._merge_existing(similar.id, tags=tags, source=source, confidence=confidence)
 
         now = _utc_now_iso()
         record = MemoryRecord(
@@ -135,14 +144,37 @@ class MemoryStore:
         if not terms:
             return self.list(limit=limit)
 
-        scored: list[tuple[int, MemoryRecord]] = []
+        scored: list[tuple[float, MemoryRecord]] = []
         for record in self.list(limit=1000):
             haystack = " ".join([record.content, *record.tags]).lower()
             score = sum(_term_score(term, haystack) for term in terms)
             if score:
+                score += record.confidence
+                score += min(record.use_count, 5) * 0.2
+                if record.kind == "preference":
+                    score += 0.5
                 scored.append((score, record))
         scored.sort(key=lambda item: (item[0], item[1].updated_at), reverse=True)
         return [record for _, record in scored[:limit]]
+
+    def mark_used(self, ids: list[str]) -> list[MemoryRecord]:
+        if not ids:
+            return []
+        id_set = set(ids)
+        now = _utc_now_iso()
+        updated: list[MemoryRecord] = []
+        records = self.list(limit=10000)
+        for record in records:
+            if record.id not in id_set:
+                continue
+            record.use_count += 1
+            record.last_used_at = now
+            record.updated_at = now
+            updated.append(record)
+        if updated:
+            self._write_all(records)
+            self.rebuild_index()
+        return updated
 
     def render_for_prompt(self, *, limit: int = 12) -> str:
         records = self.list(limit=200)
@@ -177,6 +209,53 @@ class MemoryStore:
             if record.fingerprint == fingerprint:
                 return record
         return None
+
+    def _find_similar(self, kind: MemoryKind, content: str) -> MemoryRecord | None:
+        content_keys = set(_keywords(content))
+        if not content_keys:
+            return None
+        for record in self.list(kind=kind, limit=10000):
+            record_keys = set(_keywords(record.content))
+            if not record_keys:
+                continue
+            overlap = len(content_keys & record_keys) / max(1, min(len(content_keys), len(record_keys)))
+            if overlap >= 0.75 or content in record.content or record.content in content:
+                return record
+        return None
+
+    def _merge_existing(
+        self,
+        record_id: str,
+        *,
+        tags: list[str],
+        source: dict[str, Any],
+        confidence: float,
+    ) -> MemoryRecord | None:
+        records = self.list(limit=10000)
+        merged: MemoryRecord | None = None
+        now = _utc_now_iso()
+        for record in records:
+            if record.id != record_id:
+                continue
+            record.tags = _unique([*record.tags, *tags], limit=16)
+            record.confidence = round(max(record.confidence, float(confidence)), 3)
+            record.updated_at = now
+            sources = record.source.get("merged_sources") if isinstance(record.source, dict) else None
+            if not isinstance(sources, list):
+                sources = []
+            sources.append(source)
+            record.source["merged_sources"] = sources[-8:]
+            merged = record
+            break
+        if merged:
+            self._write_all(records)
+            self.rebuild_index()
+        return merged
+
+    def _write_all(self, records: list[MemoryRecord]) -> None:
+        self.ensure_initialized()
+        text = "\n".join(json.dumps(record.to_dict(), ensure_ascii=False) for record in records)
+        self.memories_file.write_text(text + ("\n" if text else ""), encoding="utf-8")
 
 
 class MemoryReflector:
@@ -281,6 +360,83 @@ class MemoryReflector:
         )
 
 
+class LLMMemoryReflector:
+    def __init__(self, store: MemoryStore) -> None:
+        self.store = store
+
+    async def reflect(
+        self,
+        *,
+        model: Model,
+        messages: list[Message],
+        session_id: str | None = None,
+        max_items: int = 3,
+    ) -> list[MemoryRecord]:
+        formatted = _format_messages_for_llm_reflection(messages)
+        if not formatted:
+            return []
+
+        prompt = f"""请从下面这轮 AI 编程助手执行轨迹中提炼长期记忆候选。
+
+只保留未来可复用的信息，忽略一次性闲聊、临时文件名、无价值细节。
+允许的 kind 只有：preference、procedural、error_fix、project_fact。
+最多输出 {max_items} 条。
+
+输出必须是 JSON，不要 Markdown：
+{{
+  "memories": [
+    {{
+      "kind": "preference",
+      "content": "用户希望解释时偏面试话术",
+      "tags": ["interview", "preference"],
+      "confidence": 0.86,
+      "reason": "用户明确表达长期偏好"
+    }}
+  ]
+}}
+
+执行轨迹：
+{formatted}
+"""
+        result = await complete_simple(
+            model,
+            Context(messages=[UserMessage(content=prompt)], system_prompt=_LLM_MEMORY_SYSTEM_PROMPT),
+            SimpleStreamOptions(max_tokens=1200),
+        )
+        raw = "\n".join(block.text for block in result.content if isinstance(block, TextContent)).strip()
+        payload = _parse_json_object(raw)
+        items = payload.get("memories") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            return []
+
+        records: list[MemoryRecord] = []
+        for item in items[:max_items]:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind", "")).strip()
+            if kind not in {"preference", "procedural", "error_fix", "project_fact"}:
+                continue
+            content = str(item.get("content", "")).strip()
+            if not _memory_content_allowed(content):
+                continue
+            tags = [str(x) for x in item.get("tags", []) if str(x).strip()] if isinstance(item.get("tags"), list) else []
+            confidence = float(item.get("confidence", 0.75))
+            record = self.store.add(
+                kind=kind,  # type: ignore[arg-type]
+                content=content,
+                tags=[*tags, *_keywords(content)[:4]],
+                source={
+                    "session_id": session_id,
+                    "extractor": "llm_reflection",
+                    "reason": str(item.get("reason", ""))[:240],
+                },
+                confidence=max(0.0, min(1.0, confidence)),
+            )
+            if record:
+                records.append(record)
+        return records
+
+
 def _text_from_user(message: UserMessage) -> str:
     if isinstance(message.content, str):
         return message.content
@@ -305,6 +461,61 @@ def _tool_names(messages: list[Message]) -> list[str]:
         elif isinstance(message, ToolResultMessage):
             names.append(message.tool_name)
     return _unique(names, limit=12)
+
+
+_LLM_MEMORY_SYSTEM_PROMPT = """你是 CodeClaw 的长期记忆反思器。
+你的任务是把一轮执行轨迹提炼为未来可复用的长期记忆。
+记忆必须简洁、准确、可复用；不要保存敏感信息、一次性命令输出或无价值临时细节。
+只输出合法 JSON。"""
+
+
+def _format_messages_for_llm_reflection(messages: list[Message]) -> str:
+    lines: list[str] = []
+    for message in messages[-20:]:
+        if isinstance(message, UserMessage):
+            text = _text_from_user(message)
+            if text:
+                lines.append(f"User: {_clip(text, 700)}")
+        elif isinstance(message, AssistantMessage):
+            text = _text_from_assistant(message)
+            tool_calls = [block.name for block in message.content if isinstance(block, ToolCall)]
+            if text:
+                lines.append(f"Assistant: {_clip(text, 700)}")
+            if tool_calls:
+                lines.append(f"AssistantToolCalls: {', '.join(tool_calls)}")
+        elif isinstance(message, ToolResultMessage):
+            text = _text_from_tool_result(message)
+            prefix = "ToolError" if message.is_error else "ToolResult"
+            if text:
+                lines.append(f"{prefix}({message.tool_name}): {_clip(text, 500)}")
+    return "\n".join(lines).strip()
+
+
+def _parse_json_object(text: str) -> dict[str, Any]:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{.*\}", text, flags=re.S)
+    if not match:
+        return {}
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return {}
+
+
+def _memory_content_allowed(content: str) -> bool:
+    clean = re.sub(r"\s+", " ", content).strip()
+    if len(clean) < 8 or len(clean) > 1000:
+        return False
+    blocked = ("api_key", "secret", "password", "token=", "sk-")
+    return not any(item in clean.lower() for item in blocked)
+
+
+def _clip(text: str, limit: int) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    return text if len(text) <= limit else text[:limit].rstrip() + "...<truncated>"
 
 
 def _paths(text: str) -> list[str]:

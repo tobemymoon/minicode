@@ -35,7 +35,7 @@ from agent_core.types import BeforeToolCallContext, BeforeToolCallResult
 
 from .artifacts import ArtifactStore, ContextCompressor, ToolResultCompactor
 from .extensions.types import ExtensionLifecycleContext
-from .memory import MemoryReflector, MemoryStore
+from .memory import LLMMemoryReflector, MemoryReflector, MemoryStore
 from .session_store import SessionStore, new_session_id
 from .types import AgentSessionOptions
 
@@ -70,6 +70,7 @@ class AgentSession:
         self.memory_store = MemoryStore(self.workspace_dir)
         self.memory_store.ensure_initialized()
         self.memory_reflector = MemoryReflector(self.memory_store)
+        self.llm_memory_reflector = LLMMemoryReflector(self.memory_store)
         self._logged_context_artifacts: set[str] = set()
         self._active_memory_context: UserMessage | None = None
 
@@ -101,8 +102,11 @@ class AgentSession:
         self.retain_recent_messages = options.retain_recent_messages
         self.summary_builder = options.summary_builder
         self.auto_memory = options.auto_memory
+        self.llm_memory_reflection = options.llm_memory_reflection
+        self.max_memory_reflection_items = options.max_memory_reflection_items
         self.memory_prompt_limit = options.memory_prompt_limit
         self.memory_retrieval_limit = min(max(1, options.memory_prompt_limit), 5)
+        self.memory_injection_char_budget = options.memory_injection_char_budget
         self.tool_execution = options.tool_execution
         self.prompt_cache = options.prompt_cache
         self.prompt_cache_ttl = options.prompt_cache_ttl
@@ -181,7 +185,7 @@ class AgentSession:
         before_count = len(self.agent.state.messages)
         try:
             result = await self._run_with_retry(lambda: self.agent.prompt(text, images=images))
-            self._reflect_memory_from_new_messages(before_count)
+            await self._reflect_memory_from_new_messages(before_count)
             await self._compact_context_if_needed()
             await self._run_lifecycle_hooks(text=text, is_continue=False, hooks=self.after_prompt_hooks)
             return result
@@ -194,7 +198,7 @@ class AgentSession:
         before_count = len(self.agent.state.messages)
         try:
             result = await self._run_with_retry(lambda: self.agent.prompt(message))
-            self._reflect_memory_from_new_messages(before_count)
+            await self._reflect_memory_from_new_messages(before_count)
             await self._compact_context_if_needed()
             return result
         finally:
@@ -204,7 +208,7 @@ class AgentSession:
         await self._run_lifecycle_hooks(text="", is_continue=True, hooks=self.before_prompt_hooks)
         before_count = len(self.agent.state.messages)
         result = await self._run_with_retry(self.agent.continue_run)
-        self._reflect_memory_from_new_messages(before_count)
+        await self._reflect_memory_from_new_messages(before_count)
         await self._compact_context_if_needed()
         await self._run_lifecycle_hooks(text="", is_continue=True, hooks=self.after_prompt_hooks)
         return result
@@ -272,7 +276,10 @@ class AgentSession:
                 retain_recent_messages=self.retain_recent_messages,
                 summary_builder=self.summary_builder,
                 auto_memory=self.auto_memory,
+                llm_memory_reflection=self.llm_memory_reflection,
+                max_memory_reflection_items=self.max_memory_reflection_items,
                 memory_prompt_limit=self.memory_prompt_limit,
+                memory_injection_char_budget=self.memory_injection_char_budget,
                 retry_enabled=self.retry_enabled,
                 max_retries=self.max_retries,
                 retry_base_delay_ms=self.retry_base_delay_ms,
@@ -317,6 +324,7 @@ class AgentSession:
         self.memory_store = MemoryStore(self.workspace_dir)
         self.memory_store.ensure_initialized()
         self.memory_reflector = MemoryReflector(self.memory_store)
+        self.llm_memory_reflector = LLMMemoryReflector(self.memory_store)
         self._logged_context_artifacts = set()
         self._active_memory_context = None
         restored = new_store.load_session_messages()
@@ -327,14 +335,43 @@ class AgentSession:
     def _create_store(self, session_id: str):
         return SessionStore(self.workspace_dir, session_id)
 
-    def _reflect_memory_from_new_messages(self, start_index: int) -> None:
+    async def _reflect_memory_from_new_messages(self, start_index: int) -> None:
         if not self.auto_memory:
             return
         new_messages = list(self.agent.state.messages[start_index:])
         if not new_messages:
             return
-        records = self.memory_reflector.reflect(new_messages, session_id=self.session_id)
+        records = []
+        source = "rules"
+        error_message = None
+        if self.llm_memory_reflection:
+            try:
+                records = await self.llm_memory_reflector.reflect(
+                    model=self.agent.state.model,
+                    messages=new_messages,
+                    session_id=self.session_id,
+                    max_items=self.max_memory_reflection_items,
+                )
+                source = "llm"
+            except Exception as exc:
+                error_message = str(exc)
+                records = []
+                source = "rules_fallback"
         if not records:
+            records = self.memory_reflector.reflect(new_messages, session_id=self.session_id)
+            if source == "llm":
+                source = "rules_empty_fallback"
+        if not records:
+            self.store.append_event(
+                {
+                    "type": "memory_reflection",
+                    "sessionId": self.session_id,
+                    "created": 0,
+                    "memory_ids": [],
+                    "source": source,
+                    "error_message": error_message,
+                }
+            )
             return
         self.store.append_event(
             {
@@ -342,7 +379,8 @@ class AgentSession:
                 "sessionId": self.session_id,
                 "created": len(records),
                 "memory_ids": [record.id for record in records],
-                "source": "auto",
+                "source": source,
+                "error_message": error_message,
             }
         )
 
@@ -364,24 +402,66 @@ class AgentSession:
             )
             return
 
-        lines = [
-            "[Relevant Long-Term Memory]",
-            "以下是与当前任务相关的长期记忆。优先参考，但如果和当前用户明确要求冲突，以当前用户要求为准。",
-        ]
-        for record in records:
-            tags = f" tags={','.join(record.tags[:4])}" if record.tags else ""
-            lines.append(f"- {record.id} [{record.kind}] {record.content}{tags}")
+        lines, injected_ids = self._format_memory_context(records)
+        if not injected_ids:
+            self._active_memory_context = None
+            self.store.append_event(
+                {
+                    "type": "memory_retrieved",
+                    "sessionId": self.session_id,
+                    "query": query[:240],
+                    "matched_ids": [],
+                    "injected_count": 0,
+                    "char_budget": self.memory_injection_char_budget,
+                }
+            )
+            return
         self._active_memory_context = UserMessage(content=[TextContent(text="\n".join(lines))])
+        self.memory_store.mark_used(injected_ids)
         self.store.append_event(
             {
                 "type": "memory_retrieved",
                 "sessionId": self.session_id,
                 "query": query[:240],
-                "matched_ids": [record.id for record in records],
-                "injected_count": len(records),
-                "kinds": [record.kind for record in records],
+                "matched_ids": injected_ids,
+                "injected_count": len(injected_ids),
+                "kinds": [record.kind for record in records if record.id in set(injected_ids)],
+                "char_budget": self.memory_injection_char_budget,
             }
         )
+
+    def _format_memory_context(self, records: list) -> tuple[list[str], list[str]]:
+        lines = [
+            "[Relevant Long-Term Memory]",
+            "以下是与当前任务相关的长期记忆。优先参考；若与当前用户明确要求冲突，以当前要求为准。",
+        ]
+        injected_ids: list[str] = []
+        labels = {
+            "preference": "User Preferences",
+            "error_fix": "Relevant Error Fixes",
+            "procedural": "Procedural Experience",
+            "project_fact": "Project Facts",
+        }
+        for kind in ("preference", "error_fix", "procedural", "project_fact"):
+            bucket = [record for record in records if record.kind == kind and record.id not in injected_ids]
+            if not bucket:
+                continue
+            header = f"\n## {labels[kind]}"
+            if self._memory_context_chars(lines) + len(header) > self.memory_injection_char_budget:
+                break
+            lines.append(header)
+            for record in bucket:
+                tags = f" tags={','.join(record.tags[:4])}" if record.tags else ""
+                next_line = f"- {record.id} {record.content}{tags}"
+                if self._memory_context_chars(lines) + len(next_line) > self.memory_injection_char_budget:
+                    break
+                lines.append(next_line)
+                injected_ids.append(record.id)
+        return lines, injected_ids
+
+    @staticmethod
+    def _memory_context_chars(lines: list[str]) -> int:
+        return sum(len(line) + 1 for line in lines)
 
     def _retrieve_relevant_memories(self, query: str) -> list:
         records = self.memory_store.search(query, limit=self.memory_retrieval_limit)

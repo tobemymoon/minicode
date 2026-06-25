@@ -157,7 +157,10 @@ def _create_fresh_session(old: AgentSession) -> AgentSession:
             retain_recent_messages=old.retain_recent_messages,
             summary_builder=old.summary_builder,
             auto_memory=old.auto_memory,
+            llm_memory_reflection=old.llm_memory_reflection,
+            max_memory_reflection_items=old.max_memory_reflection_items,
             memory_prompt_limit=old.memory_prompt_limit,
+            memory_injection_char_budget=old.memory_injection_char_budget,
             retry_enabled=old.retry_enabled,
             max_retries=old.max_retries,
             retry_base_delay_ms=old.retry_base_delay_ms,
@@ -295,7 +298,10 @@ def _handle_memory_command(session: AgentSession, arg: str, *, output: OutputFn 
     for item in records:
         tags = ",".join(item.get("tags", [])[:4])
         suffix = f" tags={tags}" if tags else ""
-        output(f"- {item.get('id')} [{item.get('kind')}] {item.get('content')}{suffix}")
+        usage = f" use_count={item.get('use_count', 0)}"
+        if item.get("last_used_at"):
+            usage += f" last_used_at={item.get('last_used_at')}"
+        output(f"- {item.get('id')} [{item.get('kind')}] {item.get('content')}{suffix}{usage}")
 
 
 async def run(options: RunOptions) -> AssistantMessage | None:
