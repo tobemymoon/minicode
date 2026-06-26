@@ -132,6 +132,17 @@ def _format_assistant_status(message: AssistantMessage, *, ansi: bool) -> str:
     return "\n".join(lines)
 
 
+def _attach_install_approval(session: AgentSession, input_fn: InputFn, output: OutputFn, *, ansi: bool) -> None:
+    def _approve(command: str) -> bool:
+        output("")
+        output(_style("Dependency install requested", "yellow", ansi))
+        output(f"Command: {command}")
+        answer = input_fn(_style("Allow this install? [y/N] ", "yellow", ansi)).strip().lower()
+        return answer in {"y", "yes"}
+
+    session.install_approval_callback = _approve
+
+
 async def run_print(
     session: AgentSession,
     prompt: str,
@@ -247,6 +258,7 @@ async def run_interactive(
 
     ansi = _ansi_enabled(output)
     output(_welcome(session, ansi=ansi))
+    _attach_install_approval(session, input_fn, output, ansi=ansi)
     current_session = session
     while True:
         text = input_fn(_style("you> ", "cyan", ansi)).strip()
@@ -261,6 +273,7 @@ async def run_interactive(
             if switched is not None:
                 current_session.close()
                 current_session = switched
+                _attach_install_approval(current_session, input_fn, output, ansi=ansi)
             if handled:
                 continue
         await run_print(current_session, text, output=output, show_tool_events=show_tool_events)
@@ -293,6 +306,15 @@ def _create_fresh_session(old: AgentSession) -> AgentSession:
             max_memory_reflection_items=old.max_memory_reflection_items,
             memory_prompt_limit=old.memory_prompt_limit,
             memory_injection_char_budget=old.memory_injection_char_budget,
+            skills=old.skills,
+            max_routed_skills=old.max_routed_skills,
+            skill_injection_char_budget=old.skill_injection_char_budget,
+            skill_embedding_recall=old.skill_embedding_recall,
+            skill_embedding_backend=old.skill_embedding_backend,
+            skill_embedding_model_path=old.skill_embedding_model_path,
+            skill_llm_rerank=old.skill_llm_rerank,
+            skill_llm_rerank_min_confidence=old.skill_llm_rerank_min_confidence,
+            install_approval_callback=old.install_approval_callback,
             retry_enabled=old.retry_enabled,
             max_retries=old.max_retries,
             retry_base_delay_ms=old.retry_base_delay_ms,
@@ -352,6 +374,9 @@ async def _handle_interactive_command(
         return True, None
     if cmd == "/memory":
         _handle_memory_command(session, arg, output=output)
+        return True, None
+    if cmd == "/skills":
+        _handle_skills_command(session, output=output)
         return True, None
     if cmd == "/tree":
         entries = session.list_entries()
@@ -437,6 +462,17 @@ def _handle_memory_command(session: AgentSession, arg: str, *, output: OutputFn 
         if item.get("last_used_at"):
             usage += f" last_used_at={item.get('last_used_at')}"
         output(f"- {item.get('id')} [{item.get('kind')}] {item.get('content')}{suffix}{usage}")
+
+
+def _handle_skills_command(session: AgentSession, *, output: OutputFn = print) -> None:
+    skills = session.list_skills()
+    if not skills:
+        output("(empty)")
+        return
+    for item in skills:
+        triggers = ", ".join(item.get("triggers", [])[:5])
+        suffix = f" triggers={triggers}" if triggers else ""
+        output(f"- /{item.get('command_name')} {item.get('name')}: {item.get('description')}{suffix}")
 
 
 async def run(options: RunOptions) -> AssistantMessage | None:

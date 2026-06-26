@@ -36,6 +36,7 @@ class ExtensionCommandContext:
 
 
 CommandHandler = Callable[[ExtensionCommandContext], str | None | Awaitable[str | None]]
+RiskLevel = Literal["low", "medium", "high"]
 
 
 @dataclass
@@ -53,6 +54,37 @@ class SkillSpec:
     description: str
     content: str
     source_path: str
+    tags: list[str] = field(default_factory=list)
+    triggers: list[str] = field(default_factory=list)
+    negative_triggers: list[str] = field(default_factory=list)
+    requires: list[str] = field(default_factory=list)
+    risk_level: RiskLevel = "low"
+    auto_invoke: bool = True
+    pre_skills: list[str] = field(default_factory=list)
+    post_skills: list[str] = field(default_factory=list)
+    allowed_tools: list[str] = field(default_factory=list)
+    examples: list[str] = field(default_factory=list)
+    disable_model_invocation: bool = False
+
+
+@dataclass
+class SkillRouteCandidate:
+    name: str
+    score: float
+    risk_level: RiskLevel
+    auto_invoke: bool
+    reason: str
+
+
+@dataclass
+class SkillRouteResult:
+    primary_skill: str | None
+    secondary_skills: list[str]
+    confidence: float
+    risk_level: RiskLevel
+    auto_execute: bool
+    reason: str
+    candidates: list[SkillRouteCandidate] = field(default_factory=list)
 
 
 @dataclass

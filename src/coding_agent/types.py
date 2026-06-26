@@ -20,9 +20,10 @@ from agent_core import (
     PromptCacheMode,
     ToolExecutionMode,
 )
-from .extensions.types import LifecycleHook, RegisteredCommand
+from .extensions.types import LifecycleHook, RegisteredCommand, SkillSpec
 
 ConvertToLlmFn = Callable[[list[AgentMessage]], list[Message] | Awaitable[list[Message]]]
+InstallApprovalFn = Callable[[str], bool | Awaitable[bool]]
 
 
 @dataclass
@@ -70,6 +71,15 @@ class AgentSessionOptions:
     mcp_servers: Optional[list[dict[str, Any]]] = None
     mcp_client: Any | None = None
     extension_commands: dict[str, RegisteredCommand] = field(default_factory=dict)
+    skills: list[SkillSpec] = field(default_factory=list)
+    max_routed_skills: int = 1
+    skill_injection_char_budget: int = 3000
+    skill_embedding_recall: bool = True
+    skill_embedding_backend: Literal["auto", "local", "bge-m3", "off"] = "auto"
+    skill_embedding_model_path: Optional[str] = "/data4/slx/models/bge-m3"
+    skill_llm_rerank: bool = True
+    skill_llm_rerank_min_confidence: float = 0.7
+    install_approval_callback: Optional[InstallApprovalFn] = None
     before_prompt_hooks: list[LifecycleHook] = field(default_factory=list)
     after_prompt_hooks: list[LifecycleHook] = field(default_factory=list)
     before_tool_call: Optional[
@@ -135,6 +145,15 @@ class CreateAgentSessionOptions:
     mcp_servers: Optional[list[dict[str, Any]]] = None
     mcp_client: Any | None = None
     extension_commands: dict[str, RegisteredCommand] = field(default_factory=dict)
+    skills: list[SkillSpec] = field(default_factory=list)
+    max_routed_skills: int = 1
+    skill_injection_char_budget: int = 3000
+    skill_embedding_recall: bool = True
+    skill_embedding_backend: Literal["auto", "local", "bge-m3", "off"] = "auto"
+    skill_embedding_model_path: Optional[str] = "/data4/slx/models/bge-m3"
+    skill_llm_rerank: bool = True
+    skill_llm_rerank_min_confidence: float = 0.7
+    install_approval_callback: Optional[InstallApprovalFn] = None
     before_prompt_hooks: list[LifecycleHook] = field(default_factory=list)
     after_prompt_hooks: list[LifecycleHook] = field(default_factory=list)
     before_tool_call: Optional[

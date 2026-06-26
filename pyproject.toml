@@ -10,6 +10,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
+embedding = ["sentence-transformers>=3.0.0"]
 
 [project.scripts]
 codeclaw = "coding_agent.cli:main"

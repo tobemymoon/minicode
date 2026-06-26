@@ -27,6 +27,7 @@ def builtin_commands() -> list[RuntimeCommand]:
         RuntimeCommand(name="switch", description="切换到指定叶子节点", source="builtin"),
         RuntimeCommand(name="clear", description="清空当前上下文并创建新会话", source="builtin"),
         RuntimeCommand(name="memory", description="自进化长期记忆：/memory list|search|reflect", source="builtin"),
+        RuntimeCommand(name="skills", description="查看已加载 Skill", source="builtin"),
     ]
 
 

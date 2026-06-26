@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .types import LoadedExtensions, RegisteredCommand, SkillSpec
+from .types import LoadedExtensions, RegisteredCommand, RiskLevel, SkillSpec
 
 
 def discover_skill_paths(workspace_dir: str | Path, configured_paths: list[str] | None = None) -> list[Path]:
@@ -19,9 +19,11 @@ def discover_skill_paths(workspace_dir: str | Path, configured_paths: list[str] 
         seen.add(key)
         paths.append(resolved)
 
-    for default_dir in (workspace / ".codeclaw" / "skills", workspace / ".xingclaw" / "skills"):
+    for default_dir in (workspace / "skills", workspace / ".codeclaw" / "skills", workspace / ".xingclaw" / "skills"):
         if default_dir.exists() and default_dir.is_dir():
             for path in sorted(default_dir.glob("*.md")):
+                _add(path)
+            for path in sorted(default_dir.glob("*/SKILL.md")):
                 _add(path)
 
     for raw in configured_paths or []:
@@ -30,6 +32,8 @@ def discover_skill_paths(workspace_dir: str | Path, configured_paths: list[str] 
             target = workspace / raw
         if target.exists() and target.is_dir():
             for path in sorted(target.glob("*.md")):
+                _add(path)
+            for path in sorted(target.glob("*/SKILL.md")):
                 _add(path)
         elif target.exists() and target.is_file() and target.suffix.lower() == ".md":
             _add(target)
@@ -59,14 +63,23 @@ def load_skills(workspace_dir: str | Path, configured_paths: list[str] | None = 
                 description=desc,
                 content=text,
                 source_path=str(path),
+                tags=_split_meta_list(meta.get("tags", "")),
+                triggers=_split_meta_list(meta.get("triggers", "")),
+                negative_triggers=_split_meta_list(meta.get("negative_triggers", "")),
+                requires=_split_meta_list(meta.get("requires", "")),
+                risk_level=_parse_risk_level(meta.get("risk_level", "")),
+                auto_invoke=_parse_bool(meta.get("auto_invoke", "true")),
+                pre_skills=_split_meta_list(meta.get("pre_skills", "")),
+                post_skills=_split_meta_list(meta.get("post_skills", "")),
+                allowed_tools=_split_meta_list(meta.get("allowed_tools", "")),
+                examples=_split_meta_list(meta.get("examples", "")),
+                disable_model_invocation=_parse_bool(meta.get("disable-model-invocation", "")),
             )
             if cmd in seen_cmds:
                 result.diagnostics.append(f"skill command conflict: /{cmd} from {path} overrides {seen_cmds[cmd]}")
             seen_cmds[cmd] = str(path)
 
             result.skills.append(skill)
-            result.prompt_guidelines.append(f"技能约束（{title}）：按该技能流程执行。")
-            result.append_prompts.append(f"## Skill: {title}\n{text}")
             result.commands[cmd] = RegisteredCommand(
                 name=cmd,
                 description=desc,
@@ -114,6 +127,24 @@ def _slugify(text: str) -> str:
     normalized = re.sub(r"[^a-zA-Z0-9_-]+", "-", text.strip().lower())
     normalized = normalized.strip("-")
     return normalized or "skill"
+
+
+def _split_meta_list(value: str) -> list[str]:
+    if not value:
+        return []
+    parts = re.split(r"[,，;；|]", value)
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _parse_bool(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_risk_level(value: str) -> RiskLevel:
+    normalized = value.strip().lower()
+    if normalized in {"medium", "high"}:
+        return normalized  # type: ignore[return-value]
+    return "low"
 
 
 def _render_skill_prompt(skill: SkillSpec, raw_text: str) -> str:

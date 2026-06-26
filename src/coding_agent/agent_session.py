@@ -14,7 +14,9 @@ from pathlib import Path
 import asyncio
 import inspect
 import logging
+import json
 import re
+import shlex
 import uuid
 from typing import Awaitable, Callable
 
@@ -34,9 +36,10 @@ from agent_core import Agent, AgentEvent, AgentMessage, AgentOptions
 from agent_core.types import BeforeToolCallContext, BeforeToolCallResult
 
 from .artifacts import ArtifactStore, ContextCompressor, ToolResultCompactor
-from .extensions.types import ExtensionLifecycleContext
+from .extensions.types import ExtensionLifecycleContext, RiskLevel, SkillRouteCandidate, SkillRouteResult
 from .memory import LLMMemoryReflector, MemoryReflector, MemoryStore
 from .session_store import SessionStore, new_session_id
+from .skill_embeddings import SkillEmbeddingRetriever
 from .types import AgentSessionOptions
 
 logger = logging.getLogger("codeclaw.coding_agent.session")
@@ -49,6 +52,11 @@ _COMPACTION_SYSTEM_PROMPT = """你是一个上下文压缩助手。请根据以�
 4. 移除重复和冗余信息
 5. 用简洁的要点形式输出
 6. 使用中文"""
+
+_SKILL_RERANK_SYSTEM_PROMPT = """你是 CodeClaw 的 Skill Router。
+你的任务是根据用户请求和候选 Skill 摘要，选择最合适的 Skill。
+只输出合法 JSON，不要输出 Markdown。
+如果没有合适 Skill，primary_skill 输出 null。"""
 
 
 class AgentSession:
@@ -107,6 +115,20 @@ class AgentSession:
         self.memory_prompt_limit = options.memory_prompt_limit
         self.memory_retrieval_limit = min(max(1, options.memory_prompt_limit), 5)
         self.memory_injection_char_budget = options.memory_injection_char_budget
+        self.skills = list(options.skills)
+        self.max_routed_skills = options.max_routed_skills
+        self.skill_injection_char_budget = options.skill_injection_char_budget
+        self.skill_embedding_recall = options.skill_embedding_recall
+        self.skill_embedding_backend = options.skill_embedding_backend
+        self.skill_embedding_model_path = options.skill_embedding_model_path
+        self.skill_embedding_retriever = SkillEmbeddingRetriever(
+            self.skills,
+            backend=self.skill_embedding_backend,
+            model_path=self.skill_embedding_model_path,
+        )
+        self.skill_llm_rerank = options.skill_llm_rerank
+        self.skill_llm_rerank_min_confidence = options.skill_llm_rerank_min_confidence
+        self.install_approval_callback = options.install_approval_callback
         self.tool_execution = options.tool_execution
         self.prompt_cache = options.prompt_cache
         self.prompt_cache_ttl = options.prompt_cache_ttl
@@ -125,6 +147,7 @@ class AgentSession:
         self.after_tool_call = options.after_tool_call
         self._unsubscribe = self.agent.subscribe(self._on_agent_event)
         self._install_artifact_read_guard()
+        self._active_skill_context: UserMessage | None = None
 
     @property
     def messages(self) -> list[AgentMessage]:
@@ -181,6 +204,7 @@ class AgentSession:
     async def prompt(self, text: str, *, images: list[str] | None = None) -> list[AgentMessage]:
         await self._run_lifecycle_hooks(text=text, is_continue=False, hooks=self.before_prompt_hooks)
         await self._check_and_compact_before_prompt()
+        await self._prepare_skill_context(text)
         self._prepare_memory_context(text)
         before_count = len(self.agent.state.messages)
         try:
@@ -190,11 +214,14 @@ class AgentSession:
             await self._run_lifecycle_hooks(text=text, is_continue=False, hooks=self.after_prompt_hooks)
             return result
         finally:
+            self._active_skill_context = None
             self._active_memory_context = None
 
     async def prompt_message(self, message: UserMessage) -> list[AgentMessage]:
         await self._check_and_compact_before_prompt()
-        self._prepare_memory_context(_full_text_from_user(message))
+        text = _full_text_from_user(message)
+        await self._prepare_skill_context(text)
+        self._prepare_memory_context(text)
         before_count = len(self.agent.state.messages)
         try:
             result = await self._run_with_retry(lambda: self.agent.prompt(message))
@@ -202,6 +229,7 @@ class AgentSession:
             await self._compact_context_if_needed()
             return result
         finally:
+            self._active_skill_context = None
             self._active_memory_context = None
 
     async def continue_run(self) -> list[AgentMessage]:
@@ -240,6 +268,21 @@ class AgentSession:
             }
         )
         return [record.to_dict() for record in records]
+
+    def list_skills(self) -> list[dict]:
+        return [
+            {
+                "name": skill.name,
+                "command_name": skill.command_name,
+                "description": skill.description,
+                "tags": list(skill.tags),
+                "triggers": list(skill.triggers),
+                "examples": list(skill.examples),
+                "disable_model_invocation": skill.disable_model_invocation,
+                "source_path": skill.source_path,
+            }
+            for skill in self.skills
+        ]
 
     def list_entries(self) -> list[dict]:
         return self.store.list_entries()
@@ -280,6 +323,13 @@ class AgentSession:
                 max_memory_reflection_items=self.max_memory_reflection_items,
                 memory_prompt_limit=self.memory_prompt_limit,
                 memory_injection_char_budget=self.memory_injection_char_budget,
+                skills=self.skills,
+                max_routed_skills=self.max_routed_skills,
+                skill_injection_char_budget=self.skill_injection_char_budget,
+                skill_embedding_recall=self.skill_embedding_recall,
+                skill_llm_rerank=self.skill_llm_rerank,
+                skill_llm_rerank_min_confidence=self.skill_llm_rerank_min_confidence,
+                install_approval_callback=self.install_approval_callback,
                 retry_enabled=self.retry_enabled,
                 max_retries=self.max_retries,
                 retry_base_delay_ms=self.retry_base_delay_ms,
@@ -327,6 +377,7 @@ class AgentSession:
         self.llm_memory_reflector = LLMMemoryReflector(self.memory_store)
         self._logged_context_artifacts = set()
         self._active_memory_context = None
+        self._active_skill_context = None
         restored = new_store.load_session_messages()
         if not restored:
             restored = new_store.load_context_messages()
@@ -388,6 +439,273 @@ class AgentSession:
                 "error_message": error_message,
             }
         )
+
+    async def _prepare_skill_context(self, query: str) -> None:
+        query = query.strip()
+        self._active_skill_context = None
+        if not query or not self.skills or self.max_routed_skills <= 0:
+            return
+
+        route = await self._route_skill_result(query)
+        if not route.primary_skill:
+            self.store.append_event(
+                {
+                    "type": "skill_routed",
+                    "sessionId": self.session_id,
+                    "query": query[:240],
+                    "candidates": [candidate.__dict__ for candidate in route.candidates],
+                    "primary_skill": None,
+                    "secondary_skills": [],
+                    "confidence": route.confidence,
+                    "risk_level": route.risk_level,
+                    "auto_execute": route.auto_execute,
+                    "reason": route.reason,
+                    "injected_count": 0,
+                    "user_corrected": None,
+                    "success": None,
+                }
+            )
+            return
+
+        routed_skill_names = [route.primary_skill, *route.secondary_skills]
+        routed_skills = [skill for name in routed_skill_names for skill in self.skills if skill.name == name]
+        lines, injected_names = self._format_skill_context(routed_skills)
+        if not injected_names:
+            return
+        self._active_skill_context = UserMessage(content=[TextContent(text="\n".join(lines))])
+        self.store.append_event(
+            {
+                "type": "skill_routed",
+                "sessionId": self.session_id,
+                "query": query[:240],
+                "candidates": [candidate.__dict__ for candidate in route.candidates],
+                "primary_skill": route.primary_skill,
+                "secondary_skills": route.secondary_skills,
+                "confidence": route.confidence,
+                "risk_level": route.risk_level,
+                "auto_execute": route.auto_execute,
+                "reason": route.reason,
+                "injected_count": len(injected_names),
+                "char_budget": self.skill_injection_char_budget,
+                "user_corrected": None,
+                "success": None,
+            }
+        )
+
+    def _route_skills(self, query: str) -> list:
+        route = self._route_skill_result_sync(query)
+        by_name = {skill.name: skill for skill in self.skills}
+        return [
+            (candidate.score, by_name[candidate.name])
+            for candidate in route.candidates[: self.max_routed_skills]
+            if candidate.name in by_name
+        ]
+
+    async def _route_skill_result(self, query: str) -> SkillRouteResult:
+        route = self._route_skill_result_sync(query)
+        if not self._should_llm_rerank(route):
+            return route
+        return await self._llm_rerank_skill_route(query, route)
+
+    def _route_skill_result_sync(self, query: str) -> SkillRouteResult:
+        query_terms = set(_skill_terms(query))
+        if not query_terms:
+            return SkillRouteResult(
+                primary_skill=None,
+                secondary_skills=[],
+                confidence=0.0,
+                risk_level="low",
+                auto_execute=False,
+                reason="No meaningful query terms were found.",
+            )
+        keyword_candidates = self._keyword_recall(query, query_terms)
+        embedding_candidates = self._embedding_recall(query) if self.skill_embedding_recall else []
+        candidates = [
+            candidate
+            for candidate in _merge_skill_candidates(keyword_candidates, embedding_candidates)
+            if candidate.score >= 2.0
+        ]
+        candidates.sort(key=lambda item: item.score, reverse=True)
+        if not candidates:
+            return SkillRouteResult(
+                primary_skill=None,
+                secondary_skills=[],
+                confidence=0.0,
+                risk_level="low",
+                auto_execute=False,
+                reason="No skill candidate passed routing threshold.",
+                candidates=[],
+            )
+
+        primary = candidates[0]
+        secondary = [candidate.name for candidate in candidates[1 : max(1, self.max_routed_skills)]]
+        confidence = _route_confidence(primary.score, candidates[1].score if len(candidates) > 1 else 0.0)
+        return SkillRouteResult(
+            primary_skill=primary.name,
+            secondary_skills=secondary,
+            confidence=confidence,
+            risk_level=primary.risk_level,
+            auto_execute=primary.auto_invoke and primary.risk_level != "high",
+            reason=primary.reason,
+            candidates=candidates[:5],
+        )
+
+    def _keyword_recall(self, query: str, query_terms: set[str]) -> list[SkillRouteCandidate]:
+        query_lower = query.lower()
+        candidates: list[SkillRouteCandidate] = []
+        for skill in self.skills:
+            if skill.disable_model_invocation:
+                continue
+            score = 0.0
+            reasons: list[str] = []
+            trigger_terms = [item.lower() for item in skill.triggers if item.strip()]
+            negative_terms = [item.lower() for item in skill.negative_triggers if item.strip()]
+            required_terms = [item.lower() for item in skill.requires if item.strip()]
+            tag_terms = [item.lower() for item in skill.tags if item.strip()]
+            example_terms = [item.lower() for item in skill.examples if item.strip()]
+            meta_haystack = " ".join(
+                [skill.name, skill.description, " ".join(skill.tags), " ".join(skill.triggers), " ".join(skill.examples)]
+            ).lower()
+            content_haystack = skill.content[:2000].lower()
+
+            if any(_skill_phrase_matches(term, query_lower) for term in negative_terms):
+                continue
+            if required_terms and not all(_skill_phrase_matches(term, query_lower) for term in required_terms):
+                continue
+
+            for trigger in trigger_terms:
+                if _skill_phrase_matches(trigger, query_lower) or query_lower in trigger:
+                    score += 6
+                    reasons.append(f"matched trigger `{trigger}`")
+            for example in example_terms:
+                if _skill_phrase_matches(example, query_lower) or query_lower in example:
+                    score += 3
+                    reasons.append(f"matched example `{example}`")
+            for tag in tag_terms:
+                if _skill_term_matches(tag, query_lower):
+                    score += 3
+                    reasons.append(f"matched tag `{tag}`")
+            for term in query_terms:
+                if _skill_term_matches(term, meta_haystack):
+                    score += 2
+                    reasons.append(f"matched metadata term `{term}`")
+                elif _skill_term_matches(term, content_haystack):
+                    score += 0.5
+            if skill.command_name.lower() in query.lower() or skill.name.lower() in query.lower():
+                score += 8
+                reasons.append("matched skill name or command")
+            if score >= 2:
+                candidates.append(
+                    SkillRouteCandidate(
+                        name=skill.name,
+                        score=round(score, 3),
+                        risk_level=skill.risk_level,
+                        auto_invoke=skill.auto_invoke,
+                        reason="; ".join(reasons[:4]) or "matched weak content terms",
+                    )
+                )
+        return candidates
+
+    def _embedding_recall(self, query: str) -> list[SkillRouteCandidate]:
+        return self.skill_embedding_retriever.recall(query)
+
+    def _should_llm_rerank(self, route: SkillRouteResult) -> bool:
+        if not self.skill_llm_rerank or not route.candidates or route.primary_skill is None:
+            return False
+        if len(route.candidates) < 2 and route.confidence >= self.skill_llm_rerank_min_confidence:
+            return False
+        return route.confidence < self.skill_llm_rerank_min_confidence or len(route.candidates) > 1
+
+    async def _llm_rerank_skill_route(self, query: str, route: SkillRouteResult) -> SkillRouteResult:
+        by_name = {skill.name: skill for skill in self.skills}
+        candidates = [candidate for candidate in route.candidates if candidate.name in by_name][:5]
+        if not candidates:
+            return route
+        prompt = _build_skill_rerank_prompt(query, candidates, by_name)
+        try:
+            response = await complete_simple(
+                self.agent.state.model,
+                Context(
+                    system_prompt=_SKILL_RERANK_SYSTEM_PROMPT,
+                    messages=[UserMessage(content=[TextContent(text=prompt)])],
+                ),
+                SimpleStreamOptions(max_tokens=500),
+            )
+        except Exception as exc:
+            route.reason = f"{route.reason}; llm_rerank_failed={exc}"
+            return route
+
+        raw = _full_text_from_assistant(response).strip()
+        payload = _parse_json_object(raw)
+        selected = str(payload.get("primary_skill", "")).strip()
+        if selected.lower() in {"", "none", "null"}:
+            route.primary_skill = None
+            route.secondary_skills = []
+            route.confidence = 0.0
+            route.auto_execute = False
+            route.reason = str(payload.get("reason") or "LLM rerank selected no skill.")[:240]
+            return route
+        if selected not in by_name:
+            route.reason = f"{route.reason}; llm_rerank_invalid_selection={selected}"
+            return route
+
+        primary = next((candidate for candidate in candidates if candidate.name == selected), None)
+        if primary is None:
+            skill = by_name[selected]
+            primary = SkillRouteCandidate(
+                name=skill.name,
+                score=route.candidates[0].score,
+                risk_level=skill.risk_level,
+                auto_invoke=skill.auto_invoke,
+                reason="selected by llm_rerank",
+            )
+        confidence = float(payload.get("confidence", route.confidence) or route.confidence)
+        confidence = max(0.0, min(0.99, confidence))
+        skill = by_name[selected]
+        route.primary_skill = selected
+        route.secondary_skills = [
+            name for name in payload.get("secondary_skills", []) if isinstance(name, str) and name in by_name and name != selected
+        ][: max(0, self.max_routed_skills - 1)]
+        route.confidence = round(confidence, 3)
+        route.risk_level = skill.risk_level
+        route.auto_execute = bool(payload.get("auto_execute", skill.auto_invoke)) and skill.risk_level != "high"
+        route.reason = f"llm_rerank: {str(payload.get('reason') or primary.reason)[:220]}"
+        return route
+
+    def _format_skill_context(self, skills: list) -> tuple[list[str], list[str]]:
+        lines = [
+            "[Relevant Skill]",
+            (
+                "以下 Skill 与当前任务相关，仅注入命中的技能内容。"
+                "请优先按 Skill 流程执行；若与当前用户要求冲突，以当前用户要求为准。"
+            ),
+        ]
+        injected: list[str] = []
+        for skill in skills:
+            allowed = ", ".join(skill.allowed_tools) if skill.allowed_tools else "(not restricted)"
+            pre = ", ".join(skill.pre_skills) if skill.pre_skills else "(none)"
+            post = ", ".join(skill.post_skills) if skill.post_skills else "(none)"
+            header = (
+                f"\n## {skill.name}\n"
+                f"Description: {skill.description}\n"
+                f"Command: /{skill.command_name}\n"
+                f"Risk: {skill.risk_level}\n"
+                f"Auto execute: {skill.auto_invoke}\n"
+                f"Allowed tools: {allowed}\n"
+                f"Pre skills: {pre}\n"
+                f"Post skills: {post}"
+            )
+            current_chars = sum(len(line) + 1 for line in lines)
+            remaining = self.skill_injection_char_budget - current_chars - len(header) - 2
+            if remaining < 200:
+                break
+            body = _clip_text(skill.content, remaining)
+            block = f"{header}\n\n{body}"
+            if current_chars + len(block) > self.skill_injection_char_budget:
+                break
+            lines.append(block)
+            injected.append(skill.name)
+        return lines, injected
 
     def _prepare_memory_context(self, query: str) -> None:
         query = query.strip()
@@ -503,6 +821,8 @@ class AgentSession:
     ) -> list[AgentMessage]:
         result = self.context_compressor.compress(messages)
         transformed_messages = list(result.messages)
+        if self._active_skill_context is not None:
+            transformed_messages = self._inject_memory_context(transformed_messages, self._active_skill_context)
         if self._active_memory_context is not None:
             transformed_messages = self._inject_memory_context(transformed_messages, self._active_memory_context)
         for record in result.records:
@@ -544,6 +864,30 @@ class AgentSession:
                     result = await result
                 if result and result.block:
                     return result
+
+            if ctx.tool_call.name == "bash":
+                command = str(ctx.args.get("command", "")).strip()
+                if _is_dependency_install_command(command):
+                    if self.install_approval_callback is None:
+                        return BeforeToolCallResult(
+                            block=True,
+                            reason=(
+                                "Dependency installation requires explicit user approval. "
+                                f"Blocked command: {command}"
+                            ),
+                        )
+                    approved = self.install_approval_callback(command)
+                    if inspect.isawaitable(approved):
+                        approved = await approved
+                    if not approved:
+                        return BeforeToolCallResult(
+                            block=True,
+                            reason=(
+                                "User declined dependency installation. "
+                                "Use currently installed packages or a standard-library fallback."
+                            ),
+                        )
+                    return None
 
             if ctx.tool_call.name != "read_artifact":
                 return None
@@ -989,6 +1333,147 @@ def _full_text_from_user(message: UserMessage) -> str:
     if isinstance(message.content, str):
         return message.content
     return "".join(block.text for block in message.content if isinstance(block, TextContent))
+
+
+def _skill_terms(text: str) -> list[str]:
+    candidates = [
+        *re.findall(r"[A-Za-z_][A-Za-z0-9_:-]{2,}", text),
+        *re.findall(r"[\u4e00-\u9fff]{2,8}", text),
+    ]
+    stop = {"这个", "那个", "一下", "帮我", "现在", "当前", "进行", "分析", "文件"}
+    terms: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        clean = item.strip().lower()
+        if not clean or clean in stop or clean in seen:
+            continue
+        seen.add(clean)
+        terms.append(clean)
+    return terms[:40]
+
+
+def _skill_term_matches(term: str, haystack: str) -> bool:
+    if not term:
+        return False
+    if re.fullmatch(r"[a-z0-9_:-]+", term):
+        return re.search(rf"(?<![a-z0-9_:-]){re.escape(term)}(?![a-z0-9_:-])", haystack) is not None
+    return term in haystack
+
+
+def _skill_phrase_matches(phrase: str, haystack: str) -> bool:
+    phrase = phrase.strip().lower()
+    if not phrase:
+        return False
+    if re.fullmatch(r"[a-z0-9_:-]+", phrase):
+        return _skill_term_matches(phrase, haystack)
+    return phrase in haystack.replace(" ", "")
+
+
+def _route_confidence(top_score: float, second_score: float) -> float:
+    if top_score <= 0:
+        return 0.0
+    base = min(0.95, top_score / 24.0)
+    margin = max(0.0, min(0.2, (top_score - second_score) / 30.0))
+    return round(min(0.99, base + margin), 3)
+
+
+def _merge_skill_candidates(
+    keyword_candidates: list[SkillRouteCandidate],
+    embedding_candidates: list[SkillRouteCandidate],
+) -> list[SkillRouteCandidate]:
+    merged: dict[str, SkillRouteCandidate] = {}
+    for candidate in [*keyword_candidates, *embedding_candidates]:
+        existing = merged.get(candidate.name)
+        if existing is None:
+            merged[candidate.name] = candidate
+            continue
+        existing.score = round(existing.score + candidate.score, 3)
+        existing.reason = f"{existing.reason}; {candidate.reason}"
+    return list(merged.values())
+
+
+def _build_skill_rerank_prompt(query: str, candidates: list[SkillRouteCandidate], by_name: dict) -> str:
+    lines = [
+        "请根据用户请求选择最合适的 Skill。",
+        "",
+        f"用户请求：{query}",
+        "",
+        "候选 Skill：",
+    ]
+    for candidate in candidates:
+        skill = by_name[candidate.name]
+        lines.extend(
+            [
+                f"- name: {skill.name}",
+                f"  description: {skill.description}",
+                f"  triggers: {', '.join(skill.triggers[:8])}",
+                f"  tags: {', '.join(skill.tags[:8])}",
+                f"  risk_level: {skill.risk_level}",
+                f"  auto_invoke: {skill.auto_invoke}",
+                f"  recall_score: {candidate.score}",
+                f"  recall_reason: {candidate.reason}",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "输出 JSON：",
+            '{"primary_skill": "skill-name-or-null", "secondary_skills": [], "confidence": 0.0, "auto_execute": true, "reason": "short reason"}',
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _parse_json_object(text: str) -> dict:
+    try:
+        value = json.loads(text)
+        return value if isinstance(value, dict) else {}
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{.*\}", text, flags=re.S)
+    if not match:
+        return {}
+    try:
+        value = json.loads(match.group(0))
+        return value if isinstance(value, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _is_dependency_install_command(command: str) -> bool:
+    if not command:
+        return False
+    # Shell chains are common in model-generated commands; inspect each segment conservatively.
+    segments = re.split(r"\s*(?:&&|\|\||;)\s*", command)
+    return any(_is_dependency_install_segment(segment) for segment in segments if segment.strip())
+
+
+def _is_dependency_install_segment(segment: str) -> bool:
+    try:
+        parts = shlex.split(segment)
+    except ValueError:
+        parts = segment.split()
+    if len(parts) < 2:
+        return False
+
+    first = Path(parts[0]).name.lower()
+    if first in {"pip", "pip3", "pipx"} and len(parts) >= 2:
+        return parts[1] == "install"
+
+    if first in {"python", "python3", "python.exe"} and len(parts) >= 4:
+        return parts[1:4] == ["-m", "pip", "install"]
+
+    if first == "uv" and len(parts) >= 3:
+        return parts[1:3] == ["pip", "install"]
+
+    return False
+
+
+def _clip_text(text: str, limit: int) -> str:
+    clean = text.strip()
+    if len(clean) <= limit:
+        return clean
+    return clean[: max(0, limit - 40)].rstrip() + "\n...<skill content truncated>..."
 
 
 def _full_text_from_assistant(message: AssistantMessage) -> str:

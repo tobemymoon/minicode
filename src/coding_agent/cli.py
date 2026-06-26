@@ -53,6 +53,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-memory-reflection-items", type=int, default=3, help="Maximum memories created per reflection")
     parser.add_argument("--memory-prompt-limit", type=int, default=12, help="Maximum memories injected into system prompt")
     parser.add_argument("--memory-injection-char-budget", type=int, default=1600, help="Maximum chars for per-turn memory injection")
+    parser.add_argument(
+        "--skill-embedding-backend",
+        choices=["auto", "local", "bge-m3", "off"],
+        default="auto",
+        help="Skill vector recall backend. auto tries BGE-M3 then falls back to local recall.",
+    )
+    parser.add_argument(
+        "--skill-embedding-model-path",
+        default="/data4/slx/models/bge-m3",
+        help="Local embedding model path for BGE-M3 skill recall.",
+    )
     parser.add_argument("--no-retry", action="store_true", help="Disable automatic retry on transient errors")
     parser.add_argument("--max-retries", type=int, default=2, help="Maximum retry count")
     parser.add_argument("--retry-base-delay-ms", type=int, default=1200, help="Retry base delay in milliseconds")
@@ -104,6 +115,8 @@ async def _run_from_args(args: argparse.Namespace) -> int:
         max_memory_reflection_items=args.max_memory_reflection_items,
         memory_prompt_limit=args.memory_prompt_limit,
         memory_injection_char_budget=args.memory_injection_char_budget,
+        skill_embedding_backend=args.skill_embedding_backend,
+        skill_embedding_model_path=args.skill_embedding_model_path,
         retry_enabled=not bool(args.no_retry),
         max_retries=args.max_retries,
         retry_base_delay_ms=args.retry_base_delay_ms,
