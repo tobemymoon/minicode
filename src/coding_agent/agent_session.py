@@ -16,7 +16,6 @@ import inspect
 import logging
 import json
 import re
-import shlex
 import uuid
 from typing import Awaitable, Callable
 
@@ -33,11 +32,19 @@ from ai.types import (
     UserMessage,
 )
 from agent_core import Agent, AgentEvent, AgentMessage, AgentOptions
-from agent_core.types import BeforeToolCallContext, BeforeToolCallResult
+from agent_core.types import AfterToolCallContext, AfterToolCallResult, BeforeToolCallContext, BeforeToolCallResult
 
 from .artifacts import ArtifactStore, ContextCompressor, ToolResultCompactor
 from .extensions.types import ExtensionLifecycleContext, RiskLevel, SkillRouteCandidate, SkillRouteResult
 from .memory import LLMMemoryReflector, MemoryReflector, MemoryStore
+from .multi_agent import AGENT_CARDS
+from .security import (
+    build_untrusted_content_warning,
+    classify_tool_call,
+    detect_prompt_injection,
+    is_dependency_install_command,
+    tool_result_text,
+)
 from .session_store import SessionStore, new_session_id
 from .skill_embeddings import SkillEmbeddingRetriever
 from .types import AgentSessionOptions
@@ -129,6 +136,7 @@ class AgentSession:
         self.skill_llm_rerank = options.skill_llm_rerank
         self.skill_llm_rerank_min_confidence = options.skill_llm_rerank_min_confidence
         self.install_approval_callback = options.install_approval_callback
+        self.security_approval_callback = options.security_approval_callback
         self.tool_execution = options.tool_execution
         self.prompt_cache = options.prompt_cache
         self.prompt_cache_ttl = options.prompt_cache_ttl
@@ -143,11 +151,14 @@ class AgentSession:
         self.before_prompt_hooks = list(options.before_prompt_hooks)
         self.after_prompt_hooks = list(options.after_prompt_hooks)
         self._external_before_tool_call = options.before_tool_call
+        self._external_after_tool_call = options.after_tool_call
         self.before_tool_call = options.before_tool_call
         self.after_tool_call = options.after_tool_call
         self._unsubscribe = self.agent.subscribe(self._on_agent_event)
         self._install_artifact_read_guard()
+        self._install_after_tool_security_guard()
         self._active_skill_context: UserMessage | None = None
+        self._active_skill_allowed_tools: set[str] | None = None
 
     @property
     def messages(self) -> list[AgentMessage]:
@@ -215,6 +226,7 @@ class AgentSession:
             return result
         finally:
             self._active_skill_context = None
+            self._active_skill_allowed_tools = None
             self._active_memory_context = None
 
     async def prompt_message(self, message: UserMessage) -> list[AgentMessage]:
@@ -230,6 +242,7 @@ class AgentSession:
             return result
         finally:
             self._active_skill_context = None
+            self._active_skill_allowed_tools = None
             self._active_memory_context = None
 
     async def continue_run(self) -> list[AgentMessage]:
@@ -284,6 +297,20 @@ class AgentSession:
             for skill in self.skills
         ]
 
+    def list_specialist_agents(self) -> list[dict]:
+        return [
+            {
+                "name": card.name,
+                "description": card.description,
+                "role": card.role,
+                "risk_level": card.risk_level,
+                "auto_invoke": card.auto_invoke,
+                "allowed_tools": list(card.allowed_tools),
+                "forbidden": list(card.forbidden),
+            }
+            for card in AGENT_CARDS.values()
+        ]
+
     def list_entries(self) -> list[dict]:
         return self.store.list_entries()
 
@@ -330,6 +357,7 @@ class AgentSession:
                 skill_llm_rerank=self.skill_llm_rerank,
                 skill_llm_rerank_min_confidence=self.skill_llm_rerank_min_confidence,
                 install_approval_callback=self.install_approval_callback,
+                security_approval_callback=self.security_approval_callback,
                 retry_enabled=self.retry_enabled,
                 max_retries=self.max_retries,
                 retry_base_delay_ms=self.retry_base_delay_ms,
@@ -378,6 +406,7 @@ class AgentSession:
         self._logged_context_artifacts = set()
         self._active_memory_context = None
         self._active_skill_context = None
+        self._active_skill_allowed_tools = None
         restored = new_store.load_session_messages()
         if not restored:
             restored = new_store.load_context_messages()
@@ -473,6 +502,13 @@ class AgentSession:
         if not injected_names:
             return
         self._active_skill_context = UserMessage(content=[TextContent(text="\n".join(lines))])
+        allowed_tools = {
+            _canonical_permission_tool_name(tool_name)
+            for skill in routed_skills
+            for tool_name in skill.allowed_tools
+            if tool_name.strip()
+        }
+        self._active_skill_allowed_tools = allowed_tools or None
         self.store.append_event(
             {
                 "type": "skill_routed",
@@ -865,29 +901,54 @@ class AgentSession:
                 if result and result.block:
                     return result
 
-            if ctx.tool_call.name == "bash":
-                command = str(ctx.args.get("command", "")).strip()
-                if _is_dependency_install_command(command):
-                    if self.install_approval_callback is None:
-                        return BeforeToolCallResult(
-                            block=True,
-                            reason=(
-                                "Dependency installation requires explicit user approval. "
-                                f"Blocked command: {command}"
-                            ),
-                        )
-                    approved = self.install_approval_callback(command)
-                    if inspect.isawaitable(approved):
-                        approved = await approved
-                    if not approved:
-                        return BeforeToolCallResult(
-                            block=True,
-                            reason=(
-                                "User declined dependency installation. "
-                                "Use currently installed packages or a standard-library fallback."
-                            ),
-                        )
-                    return None
+            if self._active_skill_allowed_tools is not None:
+                requested_tool = _canonical_permission_tool_name(ctx.tool_call.name)
+                if requested_tool not in self._active_skill_allowed_tools:
+                    return BeforeToolCallResult(
+                        block=True,
+                        reason=(
+                            f"Tool `{ctx.tool_call.name}` is not allowed by the active Skill. "
+                            f"Allowed tools: {', '.join(sorted(self._active_skill_allowed_tools))}"
+                        ),
+                    )
+
+            decision = classify_tool_call(ctx.tool_call.name, ctx.args)
+            self.store.append_event(
+                {
+                    "type": "security_decision",
+                    "sessionId": self.session_id,
+                    "toolName": ctx.tool_call.name,
+                    "toolCallId": ctx.tool_call.id,
+                    "decision": decision.to_dict(),
+                }
+            )
+            if decision.action == "block":
+                return BeforeToolCallResult(block=True, reason=decision.reason)
+            if decision.action == "confirm":
+                approved = None
+                if self.security_approval_callback is not None:
+                    approved = self.security_approval_callback(
+                        {
+                            "tool_name": ctx.tool_call.name,
+                            "args": ctx.args,
+                            "decision": decision.to_dict(),
+                        }
+                    )
+                elif ctx.tool_call.name == "bash" and is_dependency_install_command(str(ctx.args.get("command", ""))):
+                    command = str(ctx.args.get("command", "")).strip()
+                    approved = self.install_approval_callback(command) if self.install_approval_callback else False
+                else:
+                    approved = False
+                if inspect.isawaitable(approved):
+                    approved = await approved
+                if not approved:
+                    return BeforeToolCallResult(
+                        block=True,
+                        reason=(
+                            f"User confirmation required or declined for {decision.category}: "
+                            f"{decision.reason}"
+                        ),
+                    )
 
             if ctx.tool_call.name != "read_artifact":
                 return None
@@ -916,6 +977,62 @@ class AgentSession:
 
         self.before_tool_call = _guard
         self.agent._options.before_tool_call = _guard
+
+    def _install_after_tool_security_guard(self) -> None:
+        user_after = self._external_after_tool_call
+
+        async def _guard(ctx: AfterToolCallContext, signal: object | None) -> AfterToolCallResult | None:
+            final = AfterToolCallResult()
+            if user_after:
+                result = user_after(ctx, signal)
+                if inspect.isawaitable(result):
+                    result = await result
+                if result:
+                    if result.content is not None:
+                        ctx.result.content = result.content
+                        final.content = result.content
+                    if result.details is not None:
+                        ctx.result.details = result.details
+                        final.details = result.details
+                    if result.is_error is not None:
+                        ctx.is_error = result.is_error
+                        final.is_error = result.is_error
+
+            text = tool_result_text(ctx.result.content)
+            findings = detect_prompt_injection(text)
+            if findings:
+                self.store.append_event(
+                    {
+                        "type": "security_prompt_injection",
+                        "sessionId": self.session_id,
+                        "toolName": ctx.tool_call.name,
+                        "toolCallId": ctx.tool_call.id,
+                        "findings": [finding.to_dict() for finding in findings],
+                    }
+                )
+                warning = build_untrusted_content_warning(findings)
+                content = list(ctx.result.content)
+                if content and isinstance(content[0], TextContent):
+                    content[0] = TextContent(text=warning + content[0].text)
+                else:
+                    content.insert(0, TextContent(text=warning))
+                details = ctx.result.details if isinstance(ctx.result.details, dict) else {"details": ctx.result.details}
+                details = {
+                    **details,
+                    "security": {
+                        "prompt_injection_detected": True,
+                        "findings": [finding.to_dict() for finding in findings],
+                    },
+                }
+                final.content = content
+                final.details = details
+
+            if final.content is None and final.details is None and final.is_error is None:
+                return None
+            return final
+
+        self.after_tool_call = _guard
+        self.agent._options.after_tool_call = _guard
 
     async def _on_agent_event(self, event: AgentEvent) -> None:
         self.store.append_event(event)
@@ -1440,33 +1557,15 @@ def _parse_json_object(text: str) -> dict:
         return {}
 
 
-def _is_dependency_install_command(command: str) -> bool:
-    if not command:
-        return False
-    # Shell chains are common in model-generated commands; inspect each segment conservatively.
-    segments = re.split(r"\s*(?:&&|\|\||;)\s*", command)
-    return any(_is_dependency_install_segment(segment) for segment in segments if segment.strip())
-
-
-def _is_dependency_install_segment(segment: str) -> bool:
-    try:
-        parts = shlex.split(segment)
-    except ValueError:
-        parts = segment.split()
-    if len(parts) < 2:
-        return False
-
-    first = Path(parts[0]).name.lower()
-    if first in {"pip", "pip3", "pipx"} and len(parts) >= 2:
-        return parts[1] == "install"
-
-    if first in {"python", "python3", "python.exe"} and len(parts) >= 4:
-        return parts[1:4] == ["-m", "pip", "install"]
-
-    if first == "uv" and len(parts) >= 3:
-        return parts[1:3] == ["pip", "install"]
-
-    return False
+def _canonical_permission_tool_name(name: str) -> str:
+    aliases = {
+        "read_file": "read",
+        "write_file": "write",
+        "list_dir": "ls",
+        "git diff": "bash",
+    }
+    clean = name.strip()
+    return aliases.get(clean, clean)
 
 
 def _clip_text(text: str, limit: int) -> str:

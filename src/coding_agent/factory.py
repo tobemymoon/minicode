@@ -16,6 +16,7 @@ from .builtin_tools import READ_ONLY_TOOL_NAMES, create_builtin_tools
 from .convert_to_llm import convert_to_llm
 from .extensions import load_extensions, load_skills
 from .mcp import RemoteMCPClient, create_mcp_proxy_tools, parse_mcp_tool_configs, parse_remote_mcp_server_configs
+from .multi_agent import create_multi_agent_tools
 from .resources import WorkspaceResourceLoader
 from .session_store import SessionStore
 from .system_prompt import SystemPromptBuildOptions, build_system_prompt
@@ -274,9 +275,10 @@ def create_agent_session(options: AgentSessionOptions | CreateAgentSessionOption
         bash_block_patterns=bash_block_patterns,
         edit_require_unique_match=edit_require_unique_match,
     )
+    multi_agent_tools = create_multi_agent_tools(workspace) if builtin_enabled is None or "run_subagent" in builtin_enabled else []
 
     # 同名时优先使用业务层自定义工具覆盖内置工具。
-    tool_map = {tool.name: tool for tool in builtin_tools}
+    tool_map = {tool.name: tool for tool in [*builtin_tools, *multi_agent_tools]}
     for tool in options.tools:
         tool_map[tool.name] = tool
     for tool in loaded_extensions.tools:
@@ -399,6 +401,7 @@ def create_agent_session(options: AgentSessionOptions | CreateAgentSessionOption
         skill_llm_rerank=options.skill_llm_rerank,
         skill_llm_rerank_min_confidence=options.skill_llm_rerank_min_confidence,
         install_approval_callback=options.install_approval_callback,
+        security_approval_callback=options.security_approval_callback,
         before_prompt_hooks=before_prompt_hooks,
         after_prompt_hooks=after_prompt_hooks,
         before_tool_call=before_tool_call,

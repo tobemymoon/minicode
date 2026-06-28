@@ -16,6 +16,7 @@ from typing import Sequence
 
 from .factory import create_agent_session
 from .runner import RunOptions, run
+from .session_store import find_latest_session_id
 from .types import CreateAgentSessionOptions
 
 
@@ -24,6 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=["print", "interactive", "rpc"], default="interactive")
     parser.add_argument("--workspace", default=".", help="Workspace directory")
     parser.add_argument("--session-id", default=None, help="Existing session id to resume")
+    parser.add_argument("--new-session", action="store_true", help="Start a new session instead of resuming the latest one")
     parser.add_argument("--list-entries", action="store_true", help="Print session entry ids and exit")
     parser.add_argument("--show-tree", action="store_true", help="Print session tree as JSON and exit")
     parser.add_argument("--fork-entry", default=None, help="Fork from entry id and print new session id")
@@ -97,12 +99,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def _run_from_args(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace)
+    session_id = args.session_id
+    if session_id is None and not bool(args.new_session):
+        session_id = find_latest_session_id(workspace)
+
     options = CreateAgentSessionOptions(
-        workspace_dir=Path(args.workspace),
+        workspace_dir=workspace,
         provider=args.provider,
         model_id=args.model_id,
         system_prompt=args.system_prompt,
-        session_id=args.session_id,
+        session_id=session_id,
         thinking_level=args.thinking_level,
         tool_execution=args.tool_execution,
         prompt_cache=args.prompt_cache,

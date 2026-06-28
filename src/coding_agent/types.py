@@ -24,6 +24,7 @@ from .extensions.types import LifecycleHook, RegisteredCommand, SkillSpec
 
 ConvertToLlmFn = Callable[[list[AgentMessage]], list[Message] | Awaitable[list[Message]]]
 InstallApprovalFn = Callable[[str], bool | Awaitable[bool]]
+SecurityApprovalFn = Callable[[dict[str, Any]], bool | Awaitable[bool]]
 
 
 @dataclass
@@ -80,6 +81,7 @@ class AgentSessionOptions:
     skill_llm_rerank: bool = True
     skill_llm_rerank_min_confidence: float = 0.7
     install_approval_callback: Optional[InstallApprovalFn] = None
+    security_approval_callback: Optional[SecurityApprovalFn] = None
     before_prompt_hooks: list[LifecycleHook] = field(default_factory=list)
     after_prompt_hooks: list[LifecycleHook] = field(default_factory=list)
     before_tool_call: Optional[
@@ -154,6 +156,7 @@ class CreateAgentSessionOptions:
     skill_llm_rerank: bool = True
     skill_llm_rerank_min_confidence: float = 0.7
     install_approval_callback: Optional[InstallApprovalFn] = None
+    security_approval_callback: Optional[SecurityApprovalFn] = None
     before_prompt_hooks: list[LifecycleHook] = field(default_factory=list)
     after_prompt_hooks: list[LifecycleHook] = field(default_factory=list)
     before_tool_call: Optional[

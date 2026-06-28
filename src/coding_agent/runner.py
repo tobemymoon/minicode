@@ -107,6 +107,12 @@ def _tool_label(name: str, args: dict[str, Any] | None = None) -> str:
     if name == "search_artifact":
         query = args.get("query", "")
         return f"search_artifact {_truncate(query, 40)}"
+    if name == "run_subagent":
+        agent = args.get("agent_name", "")
+        return f"subagent {agent}".strip()
+    if name == "run_agent_team":
+        mode = args.get("mode", "team")
+        return f"agent_team[{mode}] {_truncate(str(args.get('task', '')), 42)}"
     return name
 
 
@@ -141,6 +147,24 @@ def _attach_install_approval(session: AgentSession, input_fn: InputFn, output: O
         return answer in {"y", "yes"}
 
     session.install_approval_callback = _approve
+
+    def _security_approve(payload: dict[str, Any]) -> bool:
+        decision = payload.get("decision", {}) if isinstance(payload, dict) else {}
+        tool_name = payload.get("tool_name", "(unknown)") if isinstance(payload, dict) else "(unknown)"
+        args = payload.get("args", {}) if isinstance(payload, dict) else {}
+        output("")
+        output(_style("Security confirmation required", "yellow", ansi))
+        output(f"Tool: {tool_name}")
+        output(f"Risk: {decision.get('risk_level')} / {decision.get('category')}")
+        output(f"Reason: {decision.get('reason')}")
+        if tool_name == "bash" and isinstance(args, dict):
+            output(f"Command: {args.get('command', '')}")
+        elif isinstance(args, dict):
+            output(f"Args: {json.dumps(args, ensure_ascii=False)[:500]}")
+        answer = input_fn(_style("Allow this action? [y/N] ", "yellow", ansi)).strip().lower()
+        return answer in {"y", "yes"}
+
+    session.security_approval_callback = _security_approve
 
 
 async def run_print(
@@ -315,6 +339,7 @@ def _create_fresh_session(old: AgentSession) -> AgentSession:
             skill_llm_rerank=old.skill_llm_rerank,
             skill_llm_rerank_min_confidence=old.skill_llm_rerank_min_confidence,
             install_approval_callback=old.install_approval_callback,
+            security_approval_callback=old.security_approval_callback,
             retry_enabled=old.retry_enabled,
             max_retries=old.max_retries,
             retry_base_delay_ms=old.retry_base_delay_ms,
@@ -377,6 +402,9 @@ async def _handle_interactive_command(
         return True, None
     if cmd == "/skills":
         _handle_skills_command(session, output=output)
+        return True, None
+    if cmd == "/agents":
+        _handle_agents_command(session, output=output)
         return True, None
     if cmd == "/tree":
         entries = session.list_entries()
@@ -473,6 +501,19 @@ def _handle_skills_command(session: AgentSession, *, output: OutputFn = print) -
         triggers = ", ".join(item.get("triggers", [])[:5])
         suffix = f" triggers={triggers}" if triggers else ""
         output(f"- /{item.get('command_name')} {item.get('name')}: {item.get('description')}{suffix}")
+
+
+def _handle_agents_command(session: AgentSession, *, output: OutputFn = print) -> None:
+    agents = session.list_specialist_agents()
+    if not agents:
+        output("(empty)")
+        return
+    for item in agents:
+        allowed = ", ".join(item.get("allowed_tools", [])) or "(none)"
+        output(
+            f"- {item.get('name')} [{item.get('role')}, risk={item.get('risk_level')}]: "
+            f"{item.get('description')} tools={allowed}"
+        )
 
 
 async def run(options: RunOptions) -> AssistantMessage | None:

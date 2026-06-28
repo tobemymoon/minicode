@@ -14,6 +14,7 @@ embedding = ["sentence-transformers>=3.0.0"]
 
 [project.scripts]
 codeclaw = "coding_agent.cli:main"
+codeclaw-watch = "coding_agent.watch_compile:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

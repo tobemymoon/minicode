@@ -33,6 +33,52 @@ def new_session_id() -> str:
     return f"session_{created_at}"
 
 
+def find_latest_session_id(workspace_dir: str | Path) -> str | None:
+    workspace = Path(workspace_dir)
+    candidates: list[tuple[str, str]] = []
+    for runtime_dir in (RUNTIME_DIR, LEGACY_RUNTIME_DIR):
+        sessions_root = workspace / runtime_dir / "sessions"
+        if not sessions_root.exists():
+            continue
+        for session_dir in sessions_root.iterdir():
+            if not session_dir.is_dir():
+                continue
+            meta_file = session_dir / "meta.json"
+            context_file = session_dir / "context.jsonl"
+            session_file = session_dir / "session.jsonl"
+            if not meta_file.exists():
+                continue
+            try:
+                meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not _session_has_messages(meta, context_file, session_file):
+                continue
+            updated_at = str(meta.get("updated_at") or meta.get("created_at") or "")
+            if not updated_at:
+                try:
+                    updated_at = datetime.fromtimestamp(meta_file.stat().st_mtime, tz=timezone.utc).isoformat()
+                except OSError:
+                    updated_at = ""
+            candidates.append((updated_at, session_dir.name))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0])
+    return candidates[-1][1]
+
+
+def _session_has_messages(meta: dict[str, Any], context_file: Path, session_file: Path) -> bool:
+    if isinstance(meta.get("leaf_id"), str) and meta.get("leaf_id"):
+        return True
+    for path in (context_file, session_file):
+        try:
+            if path.exists() and path.read_text(encoding="utf-8").strip():
+                return True
+        except OSError:
+            continue
+    return False
+
+
 class SessionStore:
     def __init__(self, workspace_dir: str | Path, session_id: str) -> None:
         self.workspace_dir = Path(workspace_dir)

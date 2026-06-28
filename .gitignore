@@ -39,6 +39,8 @@ Thumbs.db
 .codeclaw/sessions/
 .codeclaw/artifacts/
 .codeclaw/memory/
+.codeclaw/multi_agent/
+.codeclaw/worktrees/
 .xingclaw/sessions/
 .codex
 
